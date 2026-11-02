@@ -368,19 +368,19 @@ fn nw_tokenize(text: &str) -> Vec<NwTok> {
 // ───────────────────── Newick: the BioPython parser ────────────────────
 
 /// A ``Bio.Phylo.Newick.Clade`` as the parser fills it in.
-struct Clade {
-    name: Option<String>,
-    branch_length: Option<f64>,
+pub(crate) struct Clade {
+    pub(crate) name: Option<String>,
+    pub(crate) branch_length: Option<f64>,
     comment: Option<String>,
     confidence: Option<f64>,
-    clades: Vec<usize>,
+    pub(crate) clades: Vec<usize>,
     /// The parser's temporary parent reference (``del``-eted on processing).
     parent: Option<usize>,
 }
 
-struct ParsedTree {
-    clades: Vec<Clade>,
-    root: usize,
+pub(crate) struct ParsedTree {
+    pub(crate) clades: Vec<Clade>,
+    pub(crate) root: usize,
 }
 
 fn new_clade(arena: &mut Vec<Clade>, parent: Option<usize>) -> usize {
@@ -486,7 +486,7 @@ const MULTIPLE_TREES: &str = "There are multiple trees in this file; use parse()
 
 /// ``Bio.Phylo.read(StringIO(text), "newick")``: lines are joined until one
 /// ends with ``;``; exactly one tree must result.
-fn phylo_read(text: &str) -> Result<ParsedTree, String> {
+pub(crate) fn phylo_read(text: &str) -> Result<ParsedTree, String> {
     let mut first: Option<ParsedTree> = None;
     let mut buf = String::new();
     for line in text.split('\n') {

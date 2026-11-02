@@ -26,5 +26,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(graph::newick::parse_newick, m)?)?;
     m.add_function(wrap_pyfunction!(graph::newick::complete_hybrid_gammas_py, m)?)?;
     kernels::msnc::register(m)?;
+    kernels::mpl::register(m)?;
+    kernels::seq::register(m)?;
+    kernels::snp::register(m)?;
+    graph::utils::register(m)?;
     Ok(())
 }

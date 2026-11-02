@@ -80,8 +80,18 @@ eigendecomposition of Q.
 
 from typing import Any
 import numpy as np
-from numpy import linalg as lg
 import math
+
+# Compiled numerical core (phynetpy._core): rate-matrix construction and
+# normalisation, the cached eigendecomposition behind GTR.expt, and the
+# closed-form transition matrices of the special-case models.
+from ._core import (
+    _GTRCore,
+    _gtr_jc_p_matrix,
+    _gtr_f81_p_matrix,
+    _gtr_tn93_p_matrix,
+    _gtr_k3st_p_matrix,
+)
 
 """
 SOURCES:
@@ -238,46 +248,13 @@ def _tn93_p_matrix(freqs : list[float],
     Returns:
         np.ndarray: A 4x4 row-stochastic transition probability matrix.
     """
-    pi_a, pi_c, pi_g, pi_t = (float(x) for x in freqs)
-    pi_r = pi_a + pi_g
-    pi_y = pi_c + pi_t
-
-    # Scale so that -sum_i pi_i Q_ii == 1.
-    mean_rate = 2.0 * (pi_a * pi_g * kappa_r
-                       + pi_c * pi_t * kappa_y
-                       + pi_r * pi_y)
-    alpha_r = kappa_r / mean_rate
-    alpha_y = kappa_y / mean_rate
-    beta = 1.0 / mean_rate
-
-    # Two decay modes: the transversion eigenvalue (-beta), shared by both
-    # groups, and the within-group eigenvalue, which differs between purines and
-    # pyrimidines.
-    decay_tv = math.exp(-beta * t)
-    decay_r = math.exp(-(pi_r * alpha_r + (1.0 - pi_r) * beta) * t)
-    decay_y = math.exp(-(pi_y * alpha_y + (1.0 - pi_y) * beta) * t)
-
-    # Every same-group entry is pi_j times a per-group coefficient, and the
-    # diagonal is that same product plus the group's decay term (the two
-    # expressions differ by exactly one factor of e^(lambda t)). Every
-    # cross-group entry is pi_j * (1 - decay_tv).
-    coef_r = 1.0 + (1.0 / pi_r - 1.0) * decay_tv - decay_r / pi_r
-    coef_y = 1.0 + (1.0 / pi_y - 1.0) * decay_tv - decay_y / pi_y
-    cross = 1.0 - decay_tv
-
-    # Cross-group (transversion) entries, per destination state.
-    xa, xc, xg, xt = pi_a * cross, pi_c * cross, pi_g * cross, pi_t * cross
-    # Same-group (transition) entries: A and G columns on the purine rows, C
-    # and T columns on the pyrimidine rows.
-    ra, rg = pi_a * coef_r, pi_g * coef_r
-    yc, yt = pi_c * coef_y, pi_t * coef_y
-
-    #                    A            C            G            T
-    return np.array([[ra + decay_r,   xc,          rg,           xt],
-                     [xa,             yc + decay_y, xg,          yt],
-                     [ra,             xc,          rg + decay_r, xt],
-                     [xa,             yc,          xg,           yt + decay_y]],
-                    dtype = np.double)
+    # The formula lives in the compiled core: with the transversion rate taken
+    # as 1 it scales the rates to unit mean, then combines the transversion
+    # decay mode (shared by both groups) with the purine and pyrimidine
+    # within-group decay modes, so every entry is pi_j times a per-group
+    # coefficient (plus the group's decay term on the diagonal).
+    return _gtr_tn93_p_matrix([float(x) for x in freqs],
+                              float(kappa_r), float(kappa_y), float(t))
 
 
 def _k3st_p_matrix(alpha : float,
@@ -305,24 +282,11 @@ def _k3st_p_matrix(alpha : float,
         np.ndarray: A 4x4 row-stochastic transition probability matrix.
     """
     # With uniform frequencies the normalization is just the rate sum, leaving
-    # the three scaled rates summing to 1.
-    total = alpha + beta + gamma
-    a, b, g = alpha / total, beta / total, gamma / total
-
-    e_ti = math.exp(-2.0 * (a + g) * t)
-    e_ac = math.exp(-2.0 * (b + g) * t)
-    e_at = math.exp(-2.0 * (a + b) * t)
-
-    same = 0.25 * (1.0 + e_ti + e_ac + e_at)
-    p_ti = 0.25 * (1.0 - e_ti + e_ac - e_at)
-    p_ac = 0.25 * (1.0 + e_ti - e_ac - e_at)
-    p_at = 0.25 * (1.0 - e_ti - e_ac + e_at)
-
-    #        A     C     G     T
-    return np.array([[same, p_ac, p_ti, p_at],
-                     [p_ac, same, p_at, p_ti],
-                     [p_ti, p_at, same, p_ac],
-                     [p_at, p_ti, p_ac, same]], dtype = np.double)
+    # the three scaled rates summing to 1; the compiled core then evaluates
+    # the three decay modes (one per non-trivial group character) and
+    # assembles the circulant matrix.
+    return _gtr_k3st_p_matrix(float(alpha), float(beta), float(gamma),
+                              float(t))
 
 #############################
 #### SUBSTITUTION MODELS ####
@@ -492,26 +456,19 @@ class GTR:
         Returns:
             np.ndarray: A numpy ndarray that represents the just built Q matrix.
         """
-        freqs = np.asarray(self.freqs, dtype = np.double)
-        rates = np.asarray(self.trans, dtype = np.double)
-
-        Q = np.zeros((self.states, self.states), dtype = np.double)
-
-        for i in range(self.states):
-            for j in range(self.states):
-                if i != j:
-                    Q[i][j] = rates[_rate_index(i, j, self.states)] * freqs[j]
-
-        np.fill_diagonal(Q, -Q.sum(axis = 1))
-
-        # normalize such that -1 * SUM Q_ii * pi_i = 1
-        mean_rate = -float(freqs @ np.diag(Q))
-        if mean_rate <= 0.0:
+        # The compiled core fills Q[i][j] = r_ij * pi_j, sets the diagonal so
+        # rows sum to 0 and normalizes such that -1 * SUM Q_ii * pi_i = 1. It
+        # also owns the cached eigendecomposition that expt() uses, so a fresh
+        # core is what invalidates the old one.
+        try:
+            core = _GTRCore(self.freqs, self.trans, self.states)
+        except ValueError:
             raise SubstitutionModelError("Degenerate substitution model: the \
                                           overall substitution rate is not \
-                                          positive.")
+                                          positive.") from None
 
-        self.Q = Q / mean_rate
+        self._core = core
+        self.Q = core.q_matrix()
         self._decomp = None
         return self.Q
 
@@ -536,24 +493,10 @@ class GTR:
         if self._decomp is not None:
             return self._decomp
 
-        freqs = np.asarray(self.freqs, dtype = np.double)
-
-        if np.all(freqs > 0.0):
-            sqrt_pi = np.sqrt(freqs)
-            B = (self.Q * sqrt_pi[:, None]) / sqrt_pi[None, :]
-            B = 0.5 * (B + B.T)          # symmetrize away round-off
-            evals, evecs = lg.eigh(B)
-            U = evecs / sqrt_pi[:, None]
-            U_inv = evecs.T * sqrt_pi[None, :]
-        else:
-            # A zero base frequency breaks the similarity transform; fall back
-            # to the general (slower) solver.
-            evals, U = lg.eig(self.Q)
-            evals = np.real(evals)
-            U = np.real(U)
-            U_inv = lg.inv(U)
-
-        self._decomp = (evals, U, U_inv)
+        # The compiled core symmetrizes B away from round-off and decomposes
+        # it; a zero base frequency breaks the similarity transform, in which
+        # case it falls back to the general (slower) numpy.linalg.eig solver.
+        self._decomp = self._core.decompose()
         return self._decomp
 
     def expt(self, t : float) -> np.ndarray:
@@ -575,8 +518,8 @@ class GTR:
         if t < 0.0:
             t = 0.0
 
-        evals, U, U_inv = self._decompose()
-        self.Qt = (U * np.exp(evals * t)[None, :]) @ U_inv
+        self._decompose()
+        self.Qt = self._core.expt(t)
 
         return self.Qt
     
@@ -657,9 +600,7 @@ class JC(GTR):
         if t < 0.0:
             t = 0.0
 
-        decay = math.exp(-4.0 * t / 3.0)
-        self.Qt = np.full((4, 4), 0.25 - 0.25 * decay, dtype = np.double)
-        np.fill_diagonal(self.Qt, 0.25 + 0.75 * decay)
+        self.Qt = _gtr_jc_p_matrix(t)
         return self.Qt
 
 class K80(GTR):
@@ -848,20 +789,7 @@ class F81(GTR):
         if t < 0.0:
             t = 0.0
 
-        pi_a, pi_c, pi_g, pi_t = self.freqs
-        u = 1.0 / (1.0 - (pi_a * pi_a + pi_c * pi_c
-                          + pi_g * pi_g + pi_t * pi_t))
-        decay = math.exp(-u * t)
-
-        spread = 1.0 - decay
-        a, c, g, tt = (pi_a * spread, pi_c * spread,
-                       pi_g * spread, pi_t * spread)
-
-        self.Qt = np.array([[a + decay, c,         g,         tt        ],
-                            [a,         c + decay, g,         tt        ],
-                            [a,         c,         g + decay, tt        ],
-                            [a,         c,         g,         tt + decay]],
-                           dtype = np.double)
+        self.Qt = _gtr_f81_p_matrix(self.freqs, t)
         return self.Qt
 
 class HKY(GTR):

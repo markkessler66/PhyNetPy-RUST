@@ -67,6 +67,11 @@ The MSNC density delegates to the shared ancestral-configurations DP in
 :mod:`phynetpy._msnc_density` (same kernel as :mod:`phynetpy._mcmc_gt`),
 with explicit ``theta`` scaling for substitution-unit branch lengths.
 
+The numerical work -- rate-matrix normalisation and eigendecomposition,
+``P(t)``, site-pattern compression and the pruning sweep itself -- runs in
+the compiled core (``phynetpy._core``); the classes here are the public
+faces of those kernels and keep the original constructor signatures.
+
 Docs   - [x]
 Tests  - [x]
 Design - [x]
@@ -74,12 +79,12 @@ Design - [x]
 
 from __future__ import annotations
 
-import math
 from typing import Sequence
 
 import numpy as np
 
-from .Network import Network, Node
+from . import _core
+from .Network import Network  # noqa: F401  (gene trees are Network objects)
 
 # Re-exported: one MSNC density implementation, shared with the MCMC_GT stack.
 from ._msnc_density import gene_tree_msnc_log_density  # noqa: F401
@@ -107,7 +112,8 @@ _STATE_INDEX: dict[str, int] = {"A": 0, "C": 1, "G": 2, "T": 3}
 # IUPAC ambiguity codes -> the set of concrete nucleotides they cover.  Maps
 # every character we might see in an aligned DNA matrix to a length-4 tip
 # partial-likelihood vector with 1.0 in the allowed states and 0.0 elsewhere
-# (gaps / N / ? / X are fully ambiguous -> all ones).
+# (gaps / N / ? / X are fully ambiguous -> all ones).  The compiled kernel
+# carries the same table; this copy documents the convention.
 _IUPAC: dict[str, str] = {
     "A": "A", "C": "C", "G": "G", "T": "T", "U": "T",
     "R": "AG", "Y": "CT", "S": "CG", "W": "AT", "K": "GT", "M": "AC",
@@ -130,21 +136,26 @@ def tip_partials_for_char(ch: str) -> np.ndarray:
         Unknown characters are treated as fully ambiguous (all ones), matching
         PhyloNet's permissive tip handling.
     """
-    out = np.zeros(4, dtype=np.float64)
-    allowed = _IUPAC.get(str(ch).upper())
-    if allowed is None:
-        out[:] = 1.0
-        return out
-    for nt in allowed:
-        out[_STATE_INDEX[nt]] = 1.0
-    return out
+    return _core.tip_partials_for_char(ch)
 
 
 # ======================================================================
 # Substitution models
 # ======================================================================
 
-class SubstitutionModel:
+def _native_p_matrix(method):
+    """Mark a Python ``p_matrix`` override as equal to the compiled one.
+
+    :meth:`FelsensteinCalculator.log_likelihood` evaluates ``P(t)`` inside the
+    compiled pruning loop only when a model's ``p_matrix`` is the compiled
+    implementation or carries this mark.  Any other override is called back
+    into Python for every branch, so user subclasses keep their semantics.
+    """
+    method._native_p_matrix = True
+    return method
+
+
+class SubstitutionModel(_core.SubstitutionModel):
     """Time-reversible 4-state nucleotide substitution model.
 
     Subclasses build the (un-normalised) instantaneous rate matrix ``Q`` via
@@ -168,12 +179,7 @@ class SubstitutionModel:
             rates: The six exchangeability parameters in the order
                 ``AC, AG, AT, CG, CT, GT``.
         """
-        self.pi = np.asarray(pi, dtype=np.float64)
-        if self.pi.shape != (4,):
-            raise ValueError("Base frequencies must have length 4 (A,C,G,T).")
-        if not math.isclose(float(self.pi.sum()), 1.0, abs_tol=1e-9):
-            raise ValueError("Base frequencies must sum to 1.")
-        self._rates = np.asarray(rates, dtype=np.float64)
+        self._set_params(pi, rates)
         self._build_and_decompose()
 
     # -- construction -------------------------------------------------
@@ -186,62 +192,19 @@ class SubstitutionModel:
             ``Q[i,j] = rate(i,j) * pi[j]`` (the time-reversible GTR
             parameterisation).  Diagonal is filled in by the caller.
         """
-        ac, ag, at_, cg, ct, gt = self._rates
-        r = np.array(
-            [
-                [0.0, ac, ag, at_],
-                [ac, 0.0, cg, ct],
-                [ag, cg, 0.0, gt],
-                [at_, ct, gt, 0.0],
-            ],
-            dtype=np.float64,
-        )
-        Q = r * self.pi[np.newaxis, :]
-        return Q
+        return super()._build_Q()
 
     def _build_and_decompose(self) -> None:
         """Normalise ``Q`` to unit mean rate and eigendecompose it."""
-        Q = self._build_Q()
-        np.fill_diagonal(Q, 0.0)
-        diag = -Q.sum(axis=1)
-        np.fill_diagonal(Q, diag)
-
-        # Normalise so the expected number of substitutions per unit time is 1.
-        mean_rate = -float(np.dot(self.pi, np.diag(Q)))
-        if mean_rate <= 0.0:
-            raise ValueError("Degenerate substitution model (non-positive rate).")
-        Q /= mean_rate
-        self.Q = Q
-
-        # Symmetric eigendecomposition via pi^{1/2} similarity transform: this
-        # is numerically far more stable than a general eig() and is exactly
-        # how BEAST/PhyloNet decompose a reversible Q.
-        sqrt_pi = np.sqrt(self.pi)
-        inv_sqrt_pi = 1.0 / sqrt_pi
-        B = (Q * sqrt_pi[:, None]) * inv_sqrt_pi[None, :]
-        B = 0.5 * (B + B.T)  # symmetrise away round-off
-        evals, evecs = np.linalg.eigh(B)
-        self._evals = evals
-        # Right/left eigenvectors of Q recovered from the symmetric ones.
-        self._U = inv_sqrt_pi[:, None] * evecs
-        self._Uinv = evecs.T * sqrt_pi[None, :]
+        # The compiled core fills the diagonal, scales Q to unit mean rate and
+        # performs the symmetric eigendecomposition via the pi^{1/2}
+        # similarity transform (numerically far more stable than a general
+        # eig(), and exactly how BEAST/PhyloNet decompose a reversible Q).
+        self._decompose_from(self._build_Q())
 
     # -- transition probabilities ------------------------------------
-
-    def p_matrix(self, t: float) -> np.ndarray:
-        """Transition-probability matrix ``P(t) = exp(Q t)``.
-
-        Args:
-            t: Branch length in expected substitutions per site (``>= 0``).
-
-        Returns:
-            A ``4x4`` row-stochastic matrix; ``P[i,j]`` is the probability of
-            ending in state ``j`` after time ``t`` starting from state ``i``.
-        """
-        if t < 0.0:
-            t = 0.0
-        expd = np.exp(self._evals * t)
-        return (self._U * expd[None, :]) @ self._Uinv
+    # ``p_matrix(t)`` -- P(t) = exp(Q t) from the cached eigendecomposition --
+    # is inherited from the compiled base class.
 
 
 class JC69(SubstitutionModel):
@@ -255,17 +218,12 @@ class JC69(SubstitutionModel):
     def __init__(self) -> None:
         """Construct the parameter-free JC69 model."""
         super().__init__([0.25, 0.25, 0.25, 0.25], [1.0] * 6)
+        self._use_jc69_closed_form(True)
 
+    @_native_p_matrix
     def p_matrix(self, t: float) -> np.ndarray:
         """Closed-form JC69 transition matrix (see class docstring)."""
-        if t < 0.0:
-            t = 0.0
-        e = math.exp(-4.0 * t / 3.0)
-        same = 0.25 + 0.75 * e
-        diff = 0.25 - 0.25 * e
-        P = np.full((4, 4), diff, dtype=np.float64)
-        np.fill_diagonal(P, same)
-        return P
+        return super().p_matrix(t)
 
 
 class HKY85(SubstitutionModel):
@@ -308,7 +266,7 @@ class GTR(SubstitutionModel):
 # Felsenstein pruning likelihood (vectorised over sites)
 # ======================================================================
 
-class FelsensteinCalculator:
+class FelsensteinCalculator(_core.FelsensteinCalculator):
     """Per-locus phylogenetic likelihood ``P(S | g)`` via vectorised pruning.
 
     On construction the alignment for one locus is compressed to its distinct
@@ -333,97 +291,14 @@ class FelsensteinCalculator:
                 (all strings the same length).  IUPAC ambiguity / gaps are
                 allowed and expand to tip partials.
         """
-        if not alignment:
-            raise ValueError("Empty alignment passed to FelsensteinCalculator.")
-        self.taxa: list[str] = list(alignment.keys())
-        seqs = [alignment[t] for t in self.taxa]
-        length = len(seqs[0])
-        if any(len(s) != length for s in seqs):
-            raise ValueError("All sequences in a locus must be equally long.")
+        self._compress(alignment)
 
-        # Compress to distinct column patterns with multiplicities.
-        pattern_index: dict[tuple, int] = {}
-        weights: list[int] = []
-        columns: list[tuple] = []
-        for col in range(length):
-            key = tuple(seqs[r][col].upper() for r in range(len(self.taxa)))
-            idx = pattern_index.get(key)
-            if idx is None:
-                pattern_index[key] = len(columns)
-                columns.append(key)
-                weights.append(1)
-            else:
-                weights[idx] += 1
-
-        self.n_patterns: int = len(columns)
-        self._weights = np.asarray(weights, dtype=np.float64)
-
-        # Pre-build the (n_patterns, 4) tip partials for every taxon.
-        self._tip_partials: dict[str, np.ndarray] = {}
-        for r, taxon in enumerate(self.taxa):
-            mat = np.empty((self.n_patterns, 4), dtype=np.float64)
-            for p, key in enumerate(columns):
-                mat[p] = tip_partials_for_char(key[r])
-            self._tip_partials[taxon] = mat
-
-    def log_likelihood(
-        self,
-        gene_tree: Network,
-        model: SubstitutionModel,
-        *,
-        site_rate: float = 1.0,
-    ) -> float:
-        """Felsenstein log-likelihood of the alignment on ``gene_tree``.
-
-        Args:
-            gene_tree: A rooted *tree* (one connected component, no
-                reticulations) whose leaves are labelled with this locus's
-                taxa and whose edges carry branch lengths in substitution
-                units.
-            model: The nucleotide substitution model.
-            site_rate: Optional per-locus relative mutation rate (PhyloNet's
-                ``-murate``); branch lengths are effectively scaled by this.
-                Defaults to 1.0 (rate variation off).
-
-        Returns:
-            The summed log-likelihood over all (weighted) site patterns.
-        """
-        root = gene_tree.root()
-        pi = model.pi
-        partials = self._postorder_partials(gene_tree, root, model, site_rate)
-        site_like = partials @ pi
-        # Guard against underflow on pathological branch lengths.
-        site_like = np.maximum(site_like, 1e-300)
-        return float(np.dot(np.log(site_like), self._weights))
-
-    def _postorder_partials(
-        self,
-        tree: Network,
-        node: Node,
-        model: SubstitutionModel,
-        site_rate: float,
-    ) -> np.ndarray:
-        """Conditional likelihood array ``(n_patterns, 4)`` at ``node``."""
-        children = tree.get_children(node)
-        if not children:
-            tip = self._tip_partials.get(node.label)
-            if tip is None:
-                # Leaf not in this locus's alignment -> fully ambiguous.
-                return np.ones((self.n_patterns, 4), dtype=np.float64)
-            return tip
-
-        result = np.ones((self.n_patterns, 4), dtype=np.float64)
-        for child in children:
-            edges = tree.get_edge(node, child)
-            edge = edges[0] if isinstance(edges, list) else edges
-            t = edge.get_length()
-            t = 0.0 if t is None else float(t) * site_rate
-            child_partials = self._postorder_partials(tree, child, model, site_rate)
-            P = model.p_matrix(t)
-            # (n_patterns,4) @ (4,4)^T -> probability of child data given each
-            # parent state; multiply across children (independent lineages).
-            result *= child_partials @ P.T
-        return result
+    # ``log_likelihood(gene_tree, model, *, site_rate=1.0)`` -- the post-order
+    # pruning sweep -- is inherited from the compiled base class.  It reads
+    # the gene tree through the core's node/edge tables and evaluates P(t) in
+    # Rust for the models defined here (or any subclass that keeps the
+    # inherited ``p_matrix``); a Python ``p_matrix`` override is honoured by
+    # calling back into it for every branch.
 
 
 # MSNC density: shared implementation in phynetpy._msnc_density (re-exported above).

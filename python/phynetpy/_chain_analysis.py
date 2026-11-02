@@ -72,6 +72,9 @@ LOW_ESS_THRESHOLD = 200.0
 # Core diagnostics (faithful to BEAST 1's dr.inference.trace.TraceCorrelation)
 # ======================================================================
 
+from . import _core as _core_mod
+
+
 def _as_array(values: Sequence[float]) -> np.ndarray:
     arr = np.asarray(list(values), dtype=np.float64)
     if arr.ndim != 1:
@@ -88,25 +91,7 @@ def _gamma_and_varstat(arr: np.ndarray) -> tuple[float, float]:
     of consecutive lags are added at even lags and the sum is truncated as soon
     as a pair turns non-positive (Geyer's initial positive sequence).
     """
-    n = arr.size
-    mean = float(arr.mean())
-    dev = arr - mean
-    max_lag = min(n - 1, _MAX_LAG)
-
-    gamma = np.empty(max_lag + 1, dtype=np.float64)
-    for lag in range(max_lag + 1):
-        # autocovariance at this lag, normalised by (n - lag) as in BEAST
-        gamma[lag] = float(np.dot(dev[: n - lag], dev[lag:])) / (n - lag)
-
-    var_stat = gamma[0]
-    for lag in range(1, max_lag + 1):
-        if lag % 2 == 0:
-            pair = gamma[lag - 1] + gamma[lag]
-            if pair > 0.0:
-                var_stat += 2.0 * pair
-            else:
-                break
-    return float(gamma[0]), float(var_stat)
+    return _core_mod._gamma_and_varstat(_as_array(arr).tolist())
 
 
 def effective_sample_size(values: Sequence[float]) -> float:
@@ -124,13 +109,7 @@ def effective_sample_size(values: Sequence[float]) -> float:
         The effective sample size.  ``nan`` for a constant trace (no variance,
         ESS undefined -- Tracer shows a dash) and for fewer than two samples.
     """
-    arr = _as_array(values)
-    if arr.size < 2:
-        return float("nan")
-    gamma0, var_stat = _gamma_and_varstat(arr)
-    if gamma0 == 0.0 or var_stat == 0.0:
-        return float("nan")
-    return float(arr.size * gamma0 / var_stat)
+    return _core_mod.effective_sample_size(_as_array(values).tolist())
 
 
 def autocorrelation_time(values: Sequence[float], step_size: int = 1) -> float:
@@ -145,13 +124,7 @@ def autocorrelation_time(values: Sequence[float], step_size: int = 1) -> float:
     Returns:
         ``ACT = step_size * varStat / gamma(0)``; ``nan`` for a constant trace.
     """
-    arr = _as_array(values)
-    if arr.size < 2:
-        return float("nan")
-    gamma0, var_stat = _gamma_and_varstat(arr)
-    if gamma0 == 0.0:
-        return float("nan")
-    return float(step_size * var_stat / gamma0)
+    return _core_mod.autocorrelation_time(_as_array(values).tolist(), int(step_size))
 
 
 def standard_error_of_mean(values: Sequence[float]) -> float:
@@ -160,11 +133,7 @@ def standard_error_of_mean(values: Sequence[float]) -> float:
     This is the autocorrelation-corrected error Tracer reports, *not* the naive
     ``stdev / sqrt(N)`` (which ignores between-sample dependence).
     """
-    arr = _as_array(values)
-    if arr.size < 2:
-        return float("nan")
-    _, var_stat = _gamma_and_varstat(arr)
-    return float(math.sqrt(var_stat / arr.size)) if var_stat > 0 else 0.0
+    return _core_mod.standard_error_of_mean(_as_array(values).tolist())
 
 
 def hpd_interval(
@@ -182,20 +151,7 @@ def hpd_interval(
     Returns:
         ``(lower, upper)`` bounds.  For a single sample both equal that value.
     """
-    if not 0.0 < prob <= 1.0:
-        raise ValueError("prob must be in (0, 1].")
-    arr = np.sort(_as_array(values))
-    n = arr.size
-    if n == 0:
-        raise ValueError("Cannot compute an HPD interval of no samples.")
-    if n == 1:
-        return float(arr[0]), float(arr[0])
-    n_in = max(1, int(math.ceil(prob * n)))
-    if n_in >= n:
-        return float(arr[0]), float(arr[-1])
-    widths = arr[n_in - 1 :] - arr[: n - n_in + 1]
-    k = int(np.argmin(widths))
-    return float(arr[k]), float(arr[k + n_in - 1])
+    return _core_mod.hpd_interval(_as_array(values).tolist(), float(prob))
 
 
 def geweke(
@@ -215,67 +171,29 @@ def geweke(
     Returns:
         The z-score, or ``nan`` if the chain is too short / degenerate.
     """
-    arr = _as_array(values)
-    n = arr.size
-    if n < 4 or first <= 0 or last <= 0 or first + last > 1:
-        return float("nan")
-    a = arr[: max(2, int(first * n))]
-    b = arr[n - max(2, int(last * n)) :]
-    _, va = _gamma_and_varstat(a)
-    _, vb = _gamma_and_varstat(b)
-    se = math.sqrt(va / a.size + vb / b.size)
-    if se == 0.0:
-        return float("nan")
-    return float((a.mean() - b.mean()) / se)
+    return _core_mod.geweke(_as_array(values).tolist(), float(first), float(last))
 
 
 def gelman_rubin(chains: Sequence[Sequence[float]]) -> float:
     r"""Gelman-Rubin potential scale reduction factor (R-hat).
 
-    The standard multi-chain convergence diagnostic (Gelman & Rubin 1992):
-    run ``m >= 2`` independent chains from over-dispersed starting points,
-    each of length ``n``, and compare the between-chain variance ``B`` to
-    the within-chain variance ``W``:
+    Run ``m >= 2`` independent chains, each of length ``n``, and compare the
+    between-chain variance ``B`` to the within-chain variance ``W``:
 
     .. math::
 
         \hat{V} = \frac{n - 1}{n} W + \frac{B}{n}, \qquad
         \hat{R} = \sqrt{\hat{V} / W}.
 
-    Values near ``1.0`` (a common rule of thumb is ``< 1.01`` or
-    ``< 1.05``) indicate the chains have mixed to a common distribution;
-    values well above 1 mean they have not converged.  Unlike single-chain
-    diagnostics (ESS, Geweke) this directly detects multi-modal failure
-    where each chain is internally stable but they disagree -- exactly the
-    failure mode of a network sampler stuck in different topology basins.
-
-    Args:
-        chains: A sequence of ``m`` chains, each a sequence of per-sample
-            values for one parameter (in draw order).  Chains may differ
-            in length; the common minimum length is used.
+    Values near ``1.0`` indicate the chains have mixed to a common
+    distribution.  Chains may differ in length; the common minimum length is
+    used.
 
     Returns:
         The R-hat statistic, or ``nan`` if fewer than two chains, fewer
         than two samples per chain, or the within-chain variance is zero.
     """
-    arrs = [_as_array(c) for c in chains]
-    m = len(arrs)
-    if m < 2:
-        return float("nan")
-    n = min(a.size for a in arrs)
-    if n < 2:
-        return float("nan")
-    arrs = [a[:n] for a in arrs]
-    means = np.array([a.mean() for a in arrs], dtype=np.float64)
-    variances = np.array([a.var(ddof=1) for a in arrs], dtype=np.float64)
-
-    grand_mean = float(means.mean())
-    between = n / (m - 1) * float(np.sum((means - grand_mean) ** 2))
-    within = float(variances.mean())
-    if within == 0.0:
-        return float("nan")
-    var_plus = (n - 1) / n * within + between / n
-    return float(math.sqrt(var_plus / within))
+    return _core_mod.gelman_rubin([_as_array(c).tolist() for c in chains])
 
 
 # ======================================================================

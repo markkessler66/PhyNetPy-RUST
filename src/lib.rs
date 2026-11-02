@@ -34,6 +34,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     graph::utils::register(m)?;
     kernels::allop::register(m)?;
     kernels::chain::register(m)?;
+    kernels::optimize::register(m)?;
     io::register(m)?;
     search::moves::register(m)?;
     Ok(())

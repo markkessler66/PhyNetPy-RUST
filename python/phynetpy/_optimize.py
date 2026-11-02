@@ -49,17 +49,11 @@ from typing import Any, Callable
 from .Network import Network
 from .ModelGraph import Model
 
-# Brent's bounded line search.  SciPy is a hard PhyNetPy dependency
-# (``scipy>=1.5`` in ``setup.py``), but we degrade gracefully to a pure-Python
-# golden-section search if it is somehow unavailable so the optimiser never
-# hard-crashes an inference run.
-try:  # pragma: no cover - import guard
-    from scipy.optimize import minimize_scalar as _scipy_minimize_scalar
+# Brent's bounded line search runs in the compiled core (the same bounded
+# Brent algorithm SciPy's ``minimize_scalar(method="bounded")`` implements).
+from ._core import brent_bounded_minimize as _brent_bounded_minimize
 
-    _HAS_SCIPY = True
-except Exception:  # pragma: no cover - import guard
-    _scipy_minimize_scalar = None
-    _HAS_SCIPY = False
+_HAS_SCIPY = True  # retained for callers that consulted it
 
 
 __all__ = [
@@ -111,11 +105,10 @@ def _line_minimize(
 ) -> tuple[float, float]:
     """Minimise a unimodal-ish 1-D objective on ``[lo, hi]``.
 
-    Wraps SciPy's bounded Brent minimiser (Brent, *Algorithms for
+    Runs the bounded Brent minimiser (Brent, *Algorithms for
     Minimization without Derivatives*, 1973 -- the exact reference
-    PhyloNet cites) when available, falling back to a fixed-iteration
-    golden-section search otherwise.  Both return the minimiser and the
-    objective value there.
+    PhyloNet cites) in the compiled core and returns the minimiser and
+    the objective value there.
 
     Args:
         neg_obj: The function to minimise.  Callers pass the *negative*
@@ -131,38 +124,10 @@ def _line_minimize(
     if hi <= lo:
         return lo, neg_obj(lo)
 
-    if _HAS_SCIPY:
-        res = _scipy_minimize_scalar(
-            neg_obj,
-            bounds=(lo, hi),
-            method="bounded",
-            options={"maxiter": max_iter, "xatol": xatol},
-        )
-        return float(res.x), float(res.fun)
-
-    # Golden-section fallback: no derivatives, guaranteed bracket
-    # contraction by the golden ratio each step.
-    invphi = (math.sqrt(5.0) - 1.0) / 2.0          # 1/phi  ~ 0.618
-    invphi2 = (3.0 - math.sqrt(5.0)) / 2.0         # 1/phi^2 ~ 0.382
-    a, b = lo, hi
-    c = a + invphi2 * (b - a)
-    d = a + invphi * (b - a)
-    fc = neg_obj(c)
-    fd = neg_obj(d)
-    for _ in range(max(1, max_iter)):
-        if (b - a) < xatol:
-            break
-        if fc < fd:
-            b, d, fd = d, c, fc
-            c = a + invphi2 * (b - a)
-            fc = neg_obj(c)
-        else:
-            a, c, fc = c, d, fd
-            d = a + invphi * (b - a)
-            fd = neg_obj(d)
-    if fc < fd:
-        return c, fc
-    return d, fd
+    x_best, f_best = _brent_bounded_minimize(
+        neg_obj, float(lo), float(hi), int(max_iter), float(xatol),
+    )
+    return float(x_best), float(f_best)
 
 
 def _allele_counts(mapping: dict[str, list[str]]) -> dict[str, int]:

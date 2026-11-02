@@ -79,6 +79,7 @@ from typing import TYPE_CHECKING, Any, Sequence
 
 # Relative imports
 from .Network import Network, Edge, Node
+from . import _core
 from . import _network_moves as _nm
 from .GraphUtils import count_reticulations, level as _network_level, _clone_net
 
@@ -209,13 +210,8 @@ def insert_node_in_edge(edge: Edge, node: Node, net: Network) -> None:
     edge ``a -> b`` carries an inheritance probability ``gamma`` that
     represents one component of ``b``'s parental-mass split.  After
     the insertion the new in-edge to ``b`` is ``c -> b`` (``a -> c``
-    is just a fresh tree edge feeding the new internal node), so we
-    propagate the original gamma to ``c -> b``.  Without this, every
-    ``insert_node_in_edge`` call on a retic in-edge silently breaks
-    the retic gamma sum invariant -- which is the root cause of the
-    historical 14% bad-gamma rate in ``AddReticulation``.
-    The new ``a -> c`` edge has no gamma (its retic-ness, if any,
-    is the caller's responsibility to set explicitly).
+    is just a fresh tree edge feeding the new internal node), so the
+    original gamma is propagated to ``c -> b``.
 
     Args:
         edge (Edge): An edge, a -> b
@@ -224,18 +220,39 @@ def insert_node_in_edge(edge: Edge, node: Node, net: Network) -> None:
     Returns:
         N/A
     """
-    a: Node = edge.src
-    b: Node = edge.dest
-    saved_gamma = edge.get_gamma()
+    _core.insert_node_in_edge(edge, node, net)
 
-    # Rewire the edges
-    net.remove_edge(edge)
-    net.add_edges(Edge(a, node))
-    if saved_gamma is not None and b.is_reticulation():
-        net.add_edges(Edge(node, b, gamma=saved_gamma))
-    else:
-        net.add_edges(Edge(node, b))
-    
+
+def _suppress_deg2(net: Network, node: Node) -> None:
+    """Collapse a degree-2 passthrough node into a single edge.
+
+    ``node`` must have in-degree 1 and out-degree 1; if not, this is
+    a no-op.  The two incident edges are merged into one whose
+    branch length is the sum of the originals.  Gamma is inherited
+    from the child-side edge when present, falling back to the
+    parent-side edge.
+
+    Args:
+        net: Network containing ``node``.
+        node: Candidate passthrough node.
+    """
+    _core._suppress_deg2(net, node)
+
+
+def _prune_orphan_chain(net: Network, node: Node) -> None:
+    """Iteratively remove non-root dead-end internal nodes.
+
+    Walks up from ``node``, removing each dead-end and its incoming
+    edges and collapsing any parents that become degree-2
+    passthroughs.  The root is never pruned.
+
+    Args:
+        net: Network to repair.
+        node: Starting dead-end node.
+    """
+    _core._prune_orphan_chain(net, node)
+
+
 ##################
 #### MOVE API ####
 ##################
@@ -463,10 +480,28 @@ ALL OF THE FOLLOWING NETWORK MOVES HAVE VARIABLE NAMES THAT ARE BASED OFF OF THI
       /          |           \
                  y            b
 
+Every move below delegates its graph surgery and random draws to the
+compiled core (``phynetpy._core.mv_*``), which mirrors the reference
+algorithm step for step -- same candidate orderings, same sequence of
+draws from ``model.rng`` -- so seeded searches are reproducible.
 """
 
 
-class AddReticulation(Move):
+class _TransactionalMove(Move):
+    """Shared undo/replay for moves that edit inside a network transaction."""
+
+    def undo(self, model: Model) -> None:
+        """Roll back the transaction opened by ``execute``."""
+        model.network.rollback_transaction()
+        self.undo_info = None
+        model.update_network()
+
+    def same_move(self, model: Model) -> None:
+        """No-op: replay is not supported for transactional moves."""
+        pass
+
+
+class AddReticulation(_TransactionalMove):
     """
     A move that adds a reticulation to a network.
 
@@ -474,9 +509,8 @@ class AddReticulation(Move):
     length is preserved across the two halves.  The new reticulation
     edge is given a short length drawn from Exp(mean=0.1*min_host_len)
     and both parent edges of the new reticulation node receive
-    gamma = 0.5.
-
-    Uses deep-copy for undo/same_move to guarantee correctness.
+    gamma = 0.5.  The reversible-jump log-Hastings ratio is computed
+    from the pre-move edge and reticulation counts.
     """
 
     def __init__(
@@ -502,121 +536,17 @@ class AddReticulation(Move):
         self._max_level = max_level
 
     def execute(self, model: Model) -> Model:
-        """Insert a new reticulation into ``model.network``.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-
-        Returns:
-            The same ``model`` (mutated) for chaining convenience.
-        """
-        net: Network = model.network
-
-        # Respect the per-move cap on reticulation count, if set.
-        if self._max_retics is not None:
-            if count_reticulations(net) >= self._max_retics:
-                return model
-
-        net.begin_transaction()
+        """Insert a new reticulation into ``model.network``."""
         self.undo_info = None
-
-        rng = model.rng
-        all_edges = net.E()
-        # Pre-move quantities for the reversible-jump log-Hastings ratio.
-        edge_count_pre = len(all_edges)
-        retic_count_pre = count_reticulations(net)
-        src_e = _rng_pick(rng, all_edges)
-        if src_e is None:
+        self._log_hr, update = _core.mv_add_reticulation(
+            model.network, model.rng, self._max_retics, self._max_level,
+        )
+        if update:
             model.update_network()
-            return model
-        avoid_these_edges = net.edges_upstream_of_node(src_e.src)
-        eligible = [e for e in all_edges if e not in avoid_these_edges]
-        if not eligible:
-            model.update_network()
-            return model
-        dest_e = _rng_pick(rng, eligible)
-
-        a: Node = src_e.src
-        b: Node = src_e.dest
-        x: Node = dest_e.src
-        y: Node = dest_e.dest
-        len_ab: float = src_e.get_length() or 1.0
-        len_xy: float = dest_e.get_length() or 1.0
-
-        z: Node = net.add_uid_node()
-        c: Node = net.add_uid_node()
-        c.set_is_reticulation(True)
-
-        split_ab = float(rng.random())
-        split_xy = float(rng.random())
-        retic_len = float(rng.exponential(max(0.1 * min(len_ab, len_xy), 1e-6)))
-
-        if a == x and b == y:
-            # Bubble
-            insert_node_in_edge(net.get_edge(a, b), z, net)
-            net.get_edge(a, z).set_length(len_ab * split_ab)
-            remaining = len_ab * (1.0 - split_ab)
-            net.get_edge(z, b).set_length(remaining)
-
-            insert_node_in_edge(net.get_edge(z, b), c, net)
-            tree_zc = net.get_edge(z, c)
-            tree_zc.set_length(remaining * split_xy)
-            tree_zc.set_gamma(0.5)
-            net.get_edge(c, b).set_length(remaining * (1.0 - split_xy))
-
-            net.add_edges(Edge(z, c, length=retic_len, gamma=0.5))
-            c.set_is_reticulation(True)
-        else:
-            # Standard case
-            insert_node_in_edge(net.get_edge(x, y), c, net)
-            net.get_edge(x, c).set_length(len_xy * split_xy)
-            net.get_edge(c, y).set_length(len_xy * (1.0 - split_xy))
-            net.get_edge(x, c).set_gamma(0.5)
-
-            insert_node_in_edge(net.get_edge(a, b), z, net)
-            net.get_edge(a, z).set_length(len_ab * split_ab)
-            net.get_edge(z, b).set_length(len_ab * (1.0 - split_ab))
-
-            retic_edge = Edge(z, c, length=retic_len, gamma=0.5)
-            net.add_edges(retic_edge)
-            c.set_is_reticulation(True)
-
-        # Reversible-jump log-Hastings ratio (shared with the sequence
-        # sampler via phynetpy._network_moves).  ``len_ab`` / ``len_xy``
-        # are the lengths of the two host edges that were split.  Note:
-        # this is the canonical ultrametric RJMCMC term; on a purely
-        # branch-length-parameterised network the hybrid edge introduces
-        # an extra auxiliary dimension whose density is not folded in
-        # here (documented limitation -- strict posterior inference over
-        # reticulation *number* is best done with MCMC_SEQ).
-        try:
-            self._log_hr = _nm.add_reticulation_log_hastings(
-                edge_count_pre=edge_count_pre,
-                retic_count_pre=retic_count_pre,
-                l1=len_ab,
-                l2=len_xy,
-            )
-        except ValueError:
-            self._log_hr = 0.0
-
-        if self._revert_if_exceeds_level(model):
-            return model
-
-        model.update_network()
         return model
 
-    def undo(self, model: Model) -> None:
-        """Restore the network from the deep-copy snapshot taken in ``execute``."""
-        model.network.rollback_transaction()
-        self.undo_info = None
-        model.update_network()
 
-    def same_move(self, model: Model) -> None:
-        """No-op: replay is not supported for deep-copy-based moves."""
-        pass
-
-
-class RemoveReticulation(Move):
+class RemoveReticulation(_TransactionalMove):
     """Remove a reticulation node from the network.
 
     Algorithm:
@@ -624,8 +554,6 @@ class RemoveReticulation(Move):
       2. Randomly choose one of its two parent edges to delete.
       3. Remove that parent edge.  c now has (in=1, out=1) -- suppress c.
       4. The source of the deleted edge may now be degree-2 -- suppress it.
-
-    Uses deep-copy for undo/same_move to guarantee correctness.
     """
 
     def __init__(self) -> None:
@@ -633,110 +561,31 @@ class RemoveReticulation(Move):
         super().__init__()
 
     def execute(self, model: Model) -> Model:
-        """Delete a random reticulation from ``model.network``.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-                Uses ``model.rng`` to pick the reticulation and, when it
-                has two eligible parent edges, which one to drop.
-
-        Returns:
-            The same ``model``, with the network mutated in place (or
-            left unchanged if there are no reticulations to remove).
-        """
-        net: Network = model.network
-        net.begin_transaction()
+        """Delete a random reticulation from ``model.network``."""
         self.undo_info = None
-
-        retic_nodes = [n for n in net.V()
-                       if n.is_reticulation() and net.in_degree(n) == 2]
-        if not retic_nodes:
-            return model
-
-        rng = model.rng
-        retic_count_pre = count_reticulations(net)
-        c: Node = _rng_pick(rng, retic_nodes)
-        parents = net.get_parents(c)
-        if len(parents) != 2:
-            return model
-
-        drop_parent: Node = _rng_pick(rng, parents)
-        drop_edge = net.get_edge(drop_parent, c)
-
-        net.remove_edge(drop_edge)
-
-        c.set_is_reticulation(False)
-        # Capture the length of the edge that suppressing ``c`` will
-        # produce (the reverse-add would re-split this edge); same for
-        # ``drop_parent`` below.  These are the ``l1`` / ``l2`` of the
-        # shared RJMCMC delete ratio.
-        l1 = self._merged_length_if_deg2(net, c)
-        _suppress_deg2(net, c)
-        l2 = self._merged_length_if_deg2(net, drop_parent)
-        _suppress_deg2(net, drop_parent)
-
-        edge_count_post = len(net.E())
-        if l1 is not None and l2 is not None and l1 > 0.0 and l2 > 0.0:
-            try:
-                self._log_hr = _nm.remove_reticulation_log_hastings(
-                    edge_count_post=edge_count_post,
-                    retic_count_pre=retic_count_pre,
-                    l1=l1,
-                    l2=l2,
-                )
-            except ValueError:
-                self._log_hr = 0.0
-
-        model.update_network()
+        self._log_hr, update = _core.mv_remove_reticulation(model.network, model.rng)
+        if update:
+            model.update_network()
         return model
 
     @staticmethod
     def _merged_length_if_deg2(net: Network, node: Node) -> float | None:
-        """Summed length of a degree-2 node's two incident edges, else None.
-
-        This is the length the edge produced by :func:`_suppress_deg2`
-        will carry, and hence the ``l1`` / ``l2`` consumed by the shared
-        delete-reticulation Hastings ratio.
-        """
+        """Summed length of a degree-2 node's two incident edges, else None."""
         if net.in_degree(node) != 1 or net.out_degree(node) != 1:
             return None
         in_e = list(net.in_edges(node))[0]
         out_e = list(net.out_edges(node))[0]
         return (in_e.get_length() or 0.0) + (out_e.get_length() or 0.0)
 
-    def undo(self, model: Model) -> None:
-        """Restore the network from the deep-copy snapshot taken in ``execute``."""
-        model.network.rollback_transaction()
-        self.undo_info = None
-        model.update_network()
 
-    def same_move(self, model: Model) -> None:
-        """No-op: replay is not supported for deep-copy-based moves."""
-        pass
-
-
-class FlipReticulation(Move):
+class FlipReticulation(_TransactionalMove):
     """Flip the direction of one reticulation edge.
 
     Picks a random reticulation edge ``z -> c`` and reverses it to
     ``c -> z``, provided the result is still a valid DAG.  After the
     flip, ``z`` becomes a reticulation (in-degree 2) and ``c`` may
-    lose its reticulation status.
-
-    Invariants enforced on the candidate edge before the flip:
-
-      * ``c`` must be a reticulation (so it currently has in-degree
-        2 -- otherwise the flip wouldn't produce a well-defined
-        reticulation swap).
-      * ``z`` must not be the root (the root cannot become a
-        reticulation).
-      * ``z`` must not already be a reticulation and must have
-        in-degree <= 1 (otherwise the flip would push ``z``'s
-        in-degree to 3, an invalid structure that the acyclicity
-        check does not catch).
-
-    If the post-flip network is cyclic (rare but possible through
-    other paths), the move rolls itself back via deep-copy undo.
+    lose its reticulation status.  If the post-flip network is cyclic
+    the move rolls itself back.
     """
 
     def __init__(self, max_level: int | None = None) -> None:
@@ -751,96 +600,23 @@ class FlipReticulation(Move):
         self._max_level = max_level
 
     def execute(self, model: Model) -> Model:
-        """Propose a single reticulation-edge flip on ``model.network``.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-
-        Returns:
-            The same ``model`` (mutated) for chaining convenience.
-        """
-        net: Network = model.network
-        net.begin_transaction()
+        """Propose a single reticulation-edge flip on ``model.network``."""
         self.undo_info = None
-
-        root = net.root()
-        # Enumerate edges that are safe to flip (see class docstring
-        # for the invariants filtered here).
-        retic_edges = [e for e in net.E()
-                       if e.dest.is_reticulation()
-                       and e.src is not root
-                       and not e.src.is_reticulation()
-                       and net.in_degree(e.src) <= 1]
-        if not retic_edges:
-            return model
-
-        retic_edge: Edge = _rng_pick(model.rng, retic_edges)
-        z: Node = retic_edge.src
-        c: Node = retic_edge.dest
-        saved_gamma = retic_edge.get_gamma()
-        saved_length = retic_edge.get_length()
-
-        # Reverse the edge and propagate reticulation flags.
-        net.remove_edge(retic_edge)
-        net.add_edges(Edge(c, z, length=saved_length, gamma=saved_gamma))
-
-        if net.in_degree(c) <= 1:
-            c.set_is_reticulation(False)
-        if net.in_degree(z) > 1:
-            z.set_is_reticulation(True)
-            # Reticulation invariant: gammas on z's two in-edges
-            # must sum to 1.0.  The flipped edge ``c -> z`` carries
-            # ``saved_gamma``, but z's pre-existing in-edge was a
-            # tree edge with no gamma set (or 0.0 by default).  Now
-            # that z is a reticulation we have to assign the
-            # complementary mass on that edge -- otherwise the AC DP
-            # scores z with a one-sided split and every proposal
-            # collapses to the log floor.  This was the root cause
-            # of the historical 0% accept rate for this move
-            # (verified by ``runs/diag_retic_fix_proof.py``).
-            sg = saved_gamma if saved_gamma is not None else 0.5
-            other_gamma = max(0.0, min(1.0, 1.0 - sg))
-            for in_e in net.in_edges(z):
-                if in_e.src is c:
-                    continue
-                g = in_e.get_gamma()
-                if g is None or g == 0.0 or not (0.0 < g < 1.0):
-                    in_e.set_gamma(other_gamma)
-                    break
-
-        # The above invariant filters catch the common invalid
-        # cases, but a cycle can still arise in rare topologies;
-        # fall back cleanly when it does.
-        if not net.is_acyclic():
-            model.network.rollback_transaction()
-            self.undo_info = None
+        self._log_hr, update = _core.mv_flip_reticulation(
+            model.network, model.rng, self._max_level,
+        )
+        if update:
             model.update_network()
-            return model
-
-        if self._revert_if_exceeds_level(model):
-            return model
-
-        model.update_network()
         return model
 
-    def undo(self, model: Model) -> None:
-        """Restore the network from the deep-copy snapshot taken in ``execute``."""
-        model.network.rollback_transaction()
-        self.undo_info = None
-        model.update_network()
 
-    def same_move(self, model: Model) -> None:
-        """No-op: replay is not supported for deep-copy-based moves."""
-        pass
-    
-
-class SwitchParentage(Move):
+class SwitchParentage(_TransactionalMove):
     """
     PSPP (Parentage-Switching for Polyploid Phylogenetics) move for 
     Infer_MP_Allop. Alters the genetic parentage of a subnetwork while 
-    maintaining the same ploidy values for each leaf.
-    
-    Uses deep-copy for undo/same_move to guarantee correctness.
+    maintaining the same ploidy values for each leaf.  When the
+    reattachment cannot restore every leaf's ploidy the proposal reverts
+    to a no-op rather than emit an invalid network.
     """
     def __init__(self, debug_id: int = 0) -> None:
         """Create a new ``SwitchParentage`` (PSPP) proposal.
@@ -851,334 +627,50 @@ class SwitchParentage(Move):
         """
         super().__init__()
         self.valid_attachment_edges: list[Edge] = []
-        
+
     def _random_choice(self, mylist: list, rng: np.random.Generator) -> Any:
         """Select a random element from a list, or None if empty."""
         if not mylist:
             return None
         return mylist[int(rng.integers(0, len(mylist)))]
-    
-    def execute(self, model: Model) -> Model:
-        """
-        Executes the PSPP (Switch-Parentage) move.
 
-        Args:
-            model (Model): A model object with a populated network field.
-        Returns:
-            Model: The modified model with a newly proposed network topology.
-        """
-        net: Network = model.network
-        net.begin_transaction()
+    def execute(self, model: Model) -> Model:
+        """Executes the PSPP (Switch-Parentage) move."""
         self.undo_info = None
         self.valid_attachment_edges = []
-
-        # Record the pre-move per-leaf ploidy. SwitchParentage MUST preserve
-        # it; we verify this post-reattach and revert to a no-op otherwise.
-        pre_ploidy = {leaf.label: net.subgenome_count(leaf)
-                      for leaf in net.get_leaves()}
-
-        # STEP 1: Select random non-root node
-        non_root_nodes = [node for node in net.V() if node != net.root()]
-        if not non_root_nodes:
-            model.update_network()
-            return model
-            
-        node_2_change: Node = self._random_choice(non_root_nodes, model.rng)
-        if node_2_change is None:
-            model.update_network()
-            return model
-    
-        # Skip pointless changes: a child of root whose sibling is a leaf
-        node_pars = net.get_parents(node_2_change)
-        if len(node_pars) == 1:
-            root_node = net.root()
-            if node_pars[0] == root_node:
-                root_kids = net.get_children(root_node)
-                other_kids = [n for n in root_kids if n != node_2_change]
-                if other_kids and net.out_degree(other_kids[0]) == 0:
-                    model.update_network()
-                    return model
-            
-        # STEP 2: Record target subgenome count before modification
-        target: int = net.subgenome_count(node_2_change)
-        
-        # STEP 3: Remove a parent edge
-        in_edges = list(net.in_edges(node_2_change))
-        if not in_edges:
-            model.update_network()
-            return model
-            
-        edge_2_remove: Edge = self._random_choice(in_edges, model.rng)
-        if edge_2_remove is None:
-            model.update_network()
-            return model
-            
-        self._delete_parent_edge(net, edge_2_remove)
-        
-        # STEP 4: Reconnect to achieve target subgenome count
-        original_node: Node = node_2_change
-        cur_ct = net.subgenome_count(original_node) if net.in_degree(original_node) >= 1 else 0
-        is_first_iter = True
-        
-        for _ in range(100):
-            if cur_ct == target:
-                break
-                
-            if not is_first_iter:
-                if not self.valid_attachment_edges:
-                    break
-                branch = self._random_choice(self.valid_attachment_edges, model.rng)
-                if branch is None:
-                    break
-                    
-                intermediate_node = net.add_uid_node()
-                net.remove_edge(branch)
-                self.valid_attachment_edges.remove(branch)
-                
-                e1 = Edge(branch.src, intermediate_node)
-                e2 = Edge(intermediate_node, branch.dest)
-                net.add_edges(e1)
-                net.add_edges(e2)
-                self.valid_attachment_edges.extend([e1, e2])
-                downstream_node = intermediate_node
-            else:
-                downstream_node = original_node
-                
-            # Find a root for BFS (handle disconnected components)
-            bfs_starts = [n for n in net.V()
-                          if net.in_degree(n) == 0 and net.out_degree(n) != 0]
-            if len(bfs_starts) > 1 and original_node in bfs_starts:
-                bfs_starts.remove(original_node)
-            if not bfs_starts:
-                break
-                
-            edges_to_ct = net.edges_to_subgenome_count(
-                downstream_node, target - cur_ct, bfs_starts[0])
-        
-            if not edges_to_ct:
-                break
-                
-            random_key = self._random_choice(list(edges_to_ct.keys()), model.rng)
-            if random_key is None:
-                break
-            
-            edge_list = list(edges_to_ct[random_key])
-            if not edge_list:
-                break
-                
-            new_edge = self._random_choice(edge_list, model.rng)
-            if new_edge is None:
-                break
-            
-            # Insert connector node and attach
-            connector_node = net.add_uid_node()
-            attach_target = downstream_node
-            e_to_child = Edge(connector_node, new_edge.dest)
-            e_from_parent = Edge(new_edge.src, connector_node)
-            e_to_target = Edge(connector_node, attach_target)
-            
-            net.add_edges([e_to_child, e_from_parent, e_to_target])
-            self.valid_attachment_edges.append(e_to_target)
-            net.remove_edge(new_edge)
-            
-            if net.in_degree(attach_target) > 1:
-                attach_target.set_is_reticulation(True)
-            
-            cur_ct = net.subgenome_count(original_node)
-            is_first_iter = False
-            
-        net.clean()
-        self._reconcile_reticulation_flags(net)
-
-        # Correctness guard: the iterative reattach can break out early when
-        # no valid attachment edge is available, leaving a leaf with reduced
-        # ploidy. Emitting such a network would violate the move's defining
-        # invariant (and the validity guarantee claimed for it), so in that
-        # rare case we revert to the pre-move network -- the proposal becomes
-        # a no-op rather than an invalid network.
-        if not self._ploidy_preserved(net, pre_ploidy):
-            model.network.rollback_transaction()
-            self.same_move_info = None
-            model.update_network()
-            return model
-
+        _core.mv_switch_parentage(model.network, model.rng)
         model.update_network()
         self.same_move_info = None
         return model
-
-    def _ploidy_preserved(self, net: Network, pre_ploidy: dict) -> bool:
-        """
-        Check that every leaf still carries its pre-move ploidy (subgenome
-        count). Also returns False if the leaf set changed or the count is
-        not computable, so callers can treat any of those as a failed move.
-        """
-        try:
-            post_ploidy = {leaf.label: net.subgenome_count(leaf)
-                           for leaf in net.get_leaves()}
-        except Exception:
-            return False
-        return post_ploidy == pre_ploidy
-
-    def undo(self, model: Model) -> None:
-        """Restores the network to its pre-move state."""
-        model.network.rollback_transaction()
-        self.undo_info = None
-        model.update_network()
 
     def same_move(self, model: Model) -> None:
         """Replays the same topology change on a different model instance."""
         if self.same_move_info is not None:
             model.network = _clone_net(self.same_move_info)
         model.update_network()
-         
-    def _reconcile_reticulation_flags(self, net: Network) -> None:
-        """
-        Set each node's reticulation flag to match its actual in-degree.
-        This corrects any stale flags left after topology edits or clean().
-        """
-        for node in net.V():
-            node.set_is_reticulation(net.in_degree(node) > 1)
-
-    def _delete_parent_edge(self, net: Network, edge: Edge) -> None:
-        """
-        Removes a parent edge from the network and cleans up cascading
-        degree-1 nodes and reticulation chains.
-
-        Args:
-            net (Network): The network object.
-            edge (Edge): The edge to delete (must be an actual edge in net).
-        """
-        target_node = edge.dest
-        parent_node = edge.src
-
-        net.remove_edge(edge)
-        
-        if target_node.is_reticulation() and net.in_degree(target_node) == 1:
-            target_node.set_is_reticulation(False)
-
-        # Clean up parent_node if it became degree-1 internal
-        self._cleanup_node(net, parent_node)
-    
-    def _cleanup_node(self, net: Network, node: Node) -> None:
-        """
-        Remove or bypass a node that has become topologically degenerate
-        after an edge deletion.  Handles:
-
-        - passthrough  (in=1, out=1)  → bypass
-        - orphan root  (in=0, out=1)  → remove, disconnect child
-        - isolated      (in=0, out=0)  → remove
-        - dead-end      (in>=1, out=0, non-leaf)  → remove, recurse parents
-
-        The dead-end case covers reticulation nodes whose only child edge
-        was deleted, leaving them with parents but no children.
-        """
-        in_deg = net.in_degree(node)
-        out_deg = net.out_degree(node)
-        
-        if node == net.root():
-            return
-        
-        if in_deg == 1 and out_deg == 1:
-            parent = net.get_parents(node)[0]
-            child = net.get_children(node)[0]
-            
-            parent_edge = net.get_edge(parent, node)
-            child_edge = net.get_edge(node, child)
-            
-            net.remove_edge(parent_edge)
-            net.remove_edge(child_edge)
-            net.remove_nodes(node)
-            net.add_edges(Edge(parent, child))
-            
-            if parent.is_reticulation() and net.in_degree(parent) == 1:
-                parent.set_is_reticulation(False)
-                self._cleanup_node(net, parent)
-        
-        elif in_deg == 0 and out_deg == 1:
-            child = net.get_children(node)[0]
-            child_edge = net.get_edge(node, child)
-            net.remove_edge(child_edge)
-            net.remove_nodes(node)
-        
-        elif in_deg == 0 and out_deg == 0:
-            net.remove_nodes(node)
-
-        elif in_deg >= 1 and out_deg == 0:
-            # Dead-end internal node: has parent(s) but no children.
-            # _cleanup_node only recurses upward through parents, so it
-            # never encounters a genuine leaf taxon here.
-            parents = list(net.get_parents(node))
-            for p in parents:
-                net.remove_edge(net.get_edge(p, node))
-            node.set_is_reticulation(False)
-            net.remove_nodes(node)
-            for p in parents:
-                if p.is_reticulation() and net.in_degree(p) == 1:
-                    p.set_is_reticulation(False)
-                self._cleanup_node(net, p)
 
 
-class SPR(Move):
+class SPR(_TransactionalMove):
     r"""Subtree Prune and Regraft on a phylogenetic network.
 
-    Network-safe algorithm:
-      1. Select a random edge (u -> v) to prune, subject to:
-         - v is not a leaf
-         - v is not a reticulation (we don't detach reticulation children)
-         - u is not a reticulation with out-degree 1 (would leave it (2,0))
-         - u is not root with out-degree 2 (would leave root with 1 child)
-      2. Remove the edge (u -> v).
-      3. Repair u: if u becomes (1,1), suppress u (merge incident edges).
-      4. Collect subtree nodes rooted at v (used to prevent cycles).
-      5. Select a target edge (a -> b) where neither endpoint is in the
-         subtree (prevents cycles).  Edges are weighted by inverse
-         topological distance from the prune point so that nearby
-         regraft locations are strongly preferred.
-      6. Subdivide (a -> b) by inserting a new node w:
-         a -> w -> b, with split branch lengths.
-      7. Attach: w -> v.  w is now (1,2) -- a valid internal node.
-
-    Uses deep-copy for undo/same_move to guarantee correctness.
-
-    Hastings ratio (posterior-correct).  This move is a proper
-    Metropolis-Hastings proposal: it prunes a subtree edge ``u -> v``
-    (restricted to a *suppressible* internal parent ``u``, i.e.
-    ``in-degree(u) == 1`` and ``out-degree(u) == 2``, so the move is
-    self-reversible by another SPR of the same family), removes it,
-    suppresses the resulting degree-2 ``u`` into a single edge ``e*``,
-    then regrafts ``v`` by subdividing a uniformly chosen eligible edge
-    ``a -> b`` (length ``L_t``) at a point ``split ~ U(0, 1)`` and
-    attaching ``w -> v``.
-
-    Because the intermediate network (subtree detached, ``u``
-    suppressed) is identical in the forward and reverse directions, the
-    eligible-edge counts cancel and the exact log Hastings ratio reduces
-    to a clean, closed form:
+    Prunes a random eligible subtree edge ``u -> v`` (``u`` a plain
+    internal node with in-degree 1 and out-degree 2, ``v`` not a
+    reticulation), suppresses ``u``, then regrafts ``v`` by subdividing a
+    uniformly chosen eligible edge ``a -> b`` at ``split ~ U(0, 1)`` and
+    attaching ``w -> v``.  The exact log Hastings ratio is
 
     .. math::
 
-        \log H = \log|P(N)| - \log|P(N')|
-                 + \log L_t - \log \ell_{e^*}
+        \log H = \log|P(N)| - \log|P(N')| + \log L_t - \log \ell_{e^*}
 
-    where ``|P(N)|`` / ``|P(N')|`` are the prunable-edge counts before /
-    after the move, ``L_t`` is the (pre-split) length of the subdivided
-    target edge, and ``\ell_{e^*}`` is the length of the edge created by
-    suppressing ``u``.  The final two terms are the reversible-jump
-    branch-length log-Jacobian ``log(L_t / \ell_{e^*})`` of the
-    subdivide/merge transform (the ``split`` auxiliary maps a single
-    length to two, and the suppression merges two lengths into one).
-    See ``tests/test_network_moves.py`` for the numerical detailed-balance
-    check and the derivation reference.
+    with ``|P(N)|`` / ``|P(N')|`` the prunable-edge counts before / after,
+    ``L_t`` the pre-split length of the subdivided target edge and
+    ``\ell_{e^*}`` the length of the edge created by suppressing ``u``.
 
-    The regraft is deliberately *uniform* over eligible edges: a
-    distance-weighted regraft would make the reverse proposal density
-    depend on the post-move topology in a way that is expensive and
-    brittle to evaluate exactly.  ``distance_decay`` is retained only for
-    backward-compatible construction and is ignored.
+    ``distance_decay`` is retained only for backward-compatible
+    construction and is ignored.
     """
 
-    # Retained for backward-compatible construction only; the MH-correct
-    # regraft is uniform, so this value no longer affects behaviour.
     _DEFAULT_DISTANCE_DECAY = 2.0
 
     def __init__(self,
@@ -1203,22 +695,7 @@ class SPR(Move):
 
     @staticmethod
     def _prunable_edges(net: Network) -> list[Edge]:
-        """Edges ``u -> v`` this move may prune (self-reversible subset).
-
-        The parent ``u`` must be a plain internal node (``in-degree 1``,
-        ``out-degree 2``) so that removing ``u -> v`` leaves ``u``
-        degree-2 and it collapses into a single edge -- the condition
-        that makes the prune/regraft reversible by another SPR and gives
-        the closed-form Hastings ratio.  ``v`` must not be a reticulation
-        (we never detach a reticulation child, which would orphan its
-        other parent).
-
-        Leaf children *are* prunable: single-leaf regrafts are exactly
-        what makes the SPR chain irreducible over rooted binary
-        topologies.  Forbidding them (the historical behaviour) left
-        balanced trees such as ``((A,B),(C,D))`` with zero prunable edges
-        -- an absorbing state that silently broke topology mixing.
-        """
+        """Edges ``u -> v`` this move may prune (self-reversible subset)."""
         prunable: list[Edge] = []
         for e in net.E():
             u, v = e.src, e.dest
@@ -1230,230 +707,30 @@ class SPR(Move):
         return prunable
 
     def execute(self, model: Model) -> Model:
-        """Propose a subtree-prune-and-regraft move on ``model.network``.
-
-        Prunes a random eligible subtree, then regrafts it uniformly at
-        random onto an edge outside the pruned subtree. See the class
-        docstring for the reversibility conditions and the exact
-        log-Hastings-ratio derivation.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-                Uses ``model.rng`` for both the prune and regraft
-                random draws.
-
-        Returns:
-            The same ``model``, with the network mutated in place (or
-            left unchanged if no edge is prunable or no regraft target
-            is eligible).
-        """
-        net: Network = model.network
-        net.begin_transaction()
+        """Propose a subtree-prune-and-regraft move on ``model.network``."""
         self.undo_info = None
-        self._log_hr = 0.0
-
-        prunable = self._prunable_edges(net)
-        if not prunable:
-            return model
-        p_before = len(prunable)
-
-        rng = model.rng
-        prune_edge: Edge = _rng_pick(rng, prunable)
-        prune_parent: Node = prune_edge.src
-        subtree_root: Node = prune_edge.dest
-        prune_len: float = prune_edge.get_length() or 1.0
-
-        subtree_nodes = net.get_subtree_at(subtree_root)
-
-        # Length of the edge that the suppression of ``prune_parent`` will
-        # create (e*): its remaining in-edge + remaining out-edge.  Captured
-        # before mutation for the branch-length Jacobian.
-        net.remove_edge(prune_edge)
-        in_edges = list(net.in_edges(prune_parent))
-        out_edges = list(net.out_edges(prune_parent))
-        e_star_len = 1.0
-        if len(in_edges) == 1 and len(out_edges) == 1:
-            e_star_len = (in_edges[0].get_length() or 0.0) + \
-                         (out_edges[0].get_length() or 0.0)
-        e_star_len = max(e_star_len, _SPR_MIN_LEN)
-
-        _suppress_deg2(net, prune_parent)
-
-        forbidden = subtree_nodes
-        eligible = [e for e in net.E()
-                    if e.src not in forbidden and e.dest not in forbidden]
-        if not eligible:
-            model.network.rollback_transaction()
-            self.undo_info = None
+        self._log_hr, update = _core.mv_spr(model.network, model.rng)
+        if update:
             model.update_network()
-            return model
-
-        # Uniform regraft (see class docstring: keeps the reverse density
-        # tractable so the Hastings ratio is exact).
-        target_edge: Edge = _rng_pick(rng, eligible)
-        a: Node = target_edge.src
-        b: Node = target_edge.dest
-        target_len: float = max(target_edge.get_length() or 1.0, _SPR_MIN_LEN)
-
-        new_node: Node = net.add_uid_node()
-        split = float(rng.random())
-        insert_node_in_edge(target_edge, new_node, net)
-        net.get_edge(a, new_node).set_length(target_len * split)
-        net.get_edge(new_node, b).set_length(target_len * (1.0 - split))
-
-        net.add_edges(Edge(new_node, subtree_root, length=prune_len))
-
-        model.update_network()
-
-        # Exact log Hastings ratio (incl. the subdivide/merge RJ Jacobian).
-        # The eligible-target counts cancel because the intermediate network
-        # is shared by the forward and reverse proposals.
-        p_after = len(self._prunable_edges(net))
-        self._log_hr = (
-            math.log(p_before) - math.log(p_after)
-            + math.log(target_len) - math.log(e_star_len)
-        )
         return model
-
-    def undo(self, model: Model) -> None:
-        """Restore the network from the deep-copy snapshot taken in ``execute``."""
-        model.network.rollback_transaction()
-        self.undo_info = None
-        model.update_network()
-
-    def same_move(self, model: Model) -> None:
-        """No-op: replay is not supported for deep-copy-based moves."""
-        pass
 
 
 ################################
 #### PARAMETER-LEVEL MOVES #####
 ################################
-#
-# Several moves need small structural surgery helpers below:
-#
-#   _suppress_deg2:     collapse an in=1 / out=1 passthrough node
-#                       by merging its incident edges.
-#   _prune_orphan_chain: remove a dead-end internal node plus any
-#                       ancestors that become dead-ends, suppressing
-#                       deg-2 parents along the way.
-#
-# These helpers are used by RelocateReticulation, ChangeReticSource,
-# ChangeReticDest, and friends to keep the network structurally valid
-# after edges are detached.
-#
-################################
-
-def _suppress_deg2(net: Network, node: Node) -> None:
-    """Collapse a degree-2 passthrough node into a single edge.
-
-    ``node`` must have in-degree 1 and out-degree 1; if not, this is
-    a no-op.  The two incident edges are merged into one whose
-    branch length is the sum of the originals.  Gamma is inherited
-    from the child-side edge when present, falling back to the
-    parent-side edge.
-
-    Args:
-        net: Network containing ``node``.
-        node: Candidate passthrough node.
-    """
-    if net.in_degree(node) != 1 or net.out_degree(node) != 1:
-        return
-    parent = net.get_parents(node)[0]
-    child = net.get_children(node)[0]
-    e_up = net.get_edge(parent, node)
-    e_dn = net.get_edge(node, child)
-    len_up = e_up.get_length() or 0.0
-    len_dn = e_dn.get_length() or 0.0
-    new_gamma = e_dn.get_gamma() if e_dn.get_gamma() else e_up.get_gamma()
-    net.remove_edge(e_up)
-    net.remove_edge(e_dn)
-    net.remove_nodes(node)
-    net.add_edges(Edge(parent, child, length=len_up + len_dn, gamma=new_gamma))
-
-
-def _prune_orphan_chain(net: Network, node: Node) -> None:
-    """Iteratively remove non-root dead-end internal nodes.
-
-    Several moves detach an edge whose source had out-degree 1.
-    The source is then left with in-degree >= 1 and out-degree 0
-    (an "orphan internal" node) -- MPL scoring typically NaNs on
-    networks in this state, and even when it doesn't, the orphan
-    chain wastes proposals.
-
-    This helper walks up from ``node``, removing each dead-end and
-    its incoming edges and collapsing any parents that become
-    degree-2 passthroughs.  The root is never pruned; if the chain
-    reaches an in-degree-0 node, we stop.  Safe against parent
-    nodes that have already been removed by an earlier recursion
-    (e.g. "bubble" reticulations where both parents coincide).
-
-    Args:
-        net: Network to repair.
-        node: Starting dead-end node.
-    """
-    stack = [node]
-    while stack:
-        n = stack.pop()
-        # The same parent may appear in multiple orphan chains and could
-        # have been removed already; skip nodes that are no longer present.
-        # ``n in net`` is an O(1) membership test (Graph.__contains__) vs.
-        # ``n in net.V()`` which materializes the whole node list.
-        if n not in net:
-            continue
-        if net.in_degree(n) == 0:
-            continue
-        if net.out_degree(n) != 0:
-            continue
-        parents = list(net.get_parents(n))
-        for e in list(net.in_edges(n)):
-            net.remove_edge(e)
-        try:
-            net.remove_nodes(n)
-        except Exception:
-            pass
-        for p in parents:
-            if p not in net:
-                continue
-            if net.in_degree(p) > 0 and net.out_degree(p) == 0:
-                stack.append(p)
-            elif net.in_degree(p) == 1 and net.out_degree(p) == 1:
-                _suppress_deg2(net, p)
 
 
 class ChangeNodeHeight(Move):
     """Slide an internal node up or down by adjusting incident branch lengths.
 
     A random internal (non-root, non-leaf) node is chosen and shifted by
-    a Gaussian delta.  The step standard deviation is ``sigma_frac``
-    times the feasible half-range (the maximum shift that doesn't push
-    any incident branch below ``_EPSILON``), so proposals stay in
-    bounds naturally while still concentrating mass around the current
-    height.  ``sigma_frac`` is meant to be tuned by ``MPLKernel``'s
-    adaptive scheduler so the acceptance rate tracks a target.
-
-    Leaf branches (edges whose destination is a tip) are never modified.
-    Under the MSC they carry a single lineage in and out, so their
-    coalescent contribution ``g_{1,1}`` is 1.0 for any length: the
-    length is non-identifiable and optimising it only wastes proposal
-    budget.  Concretely, the downward ``-delta`` adjustment is applied
-    only to child edges that terminate at internal nodes.  A cherry
-    node (all children are tips) is still eligible -- the move simply
-    reduces to perturbing its internal parent branch, which *is*
-    identifiable -- but its leaf branches are left untouched.
-
-    The uniform proposal it replaced was equivalent to
-    ``sigma_frac ≈ 0.58`` (sd of a uniform is ``half_range/sqrt(3)``)
-    and always ignored acceptance feedback.  Starting at ``0.4`` gives
-    a tighter, higher-acceptance default that the adaptive layer can
-    still crank back up when useful.
+    a truncated-Gaussian delta whose standard deviation is ``sigma_frac``
+    times the feasible half-range.  Leaf branches are never modified (they
+    are non-identifiable under the MSC).
     """
 
     _EPSILON = 1e-6
     _DEFAULT_SIGMA_FRAC = 0.4
-    # Bound the truncation fallback.  If the random Gaussian draw lands
-    # outside [lower, upper], resample up to this many times before
-    # clamping.  Three is enough in practice for sigma_frac <= 1.
     _TRUNCATE_RETRIES = 3
 
     def __init__(self, sigma_frac: float | None = None) -> None:
@@ -1461,9 +738,8 @@ class ChangeNodeHeight(Move):
 
         Args:
             sigma_frac: Fraction of the feasible half-range used as the
-                standard deviation of the truncated-Gaussian slide
-                (see class docstring). Defaults to
-                :attr:`_DEFAULT_SIGMA_FRAC` when ``None``.
+                standard deviation of the truncated-Gaussian slide.
+                Defaults to :attr:`_DEFAULT_SIGMA_FRAC` when ``None``.
         """
         super().__init__()
         self._sigma_frac = (
@@ -1472,152 +748,25 @@ class ChangeNodeHeight(Move):
 
     @staticmethod
     def _is_leaf_edge(net: Network, edge: Edge) -> bool:
-        """True when ``edge`` terminates at a leaf (tip) node.
-
-        A leaf branch is any edge whose destination has out-degree 0.
-        Such branches are non-identifiable under the MSC: with a single
-        sampled lineage per tip, exactly one lineage enters and leaves
-        the terminal branch, so the coalescent factor ``g_{1,1}`` equals
-        1.0 regardless of length.  Proposing changes to them therefore
-        cannot improve the likelihood and only wastes proposal budget,
-        so :class:`ChangeNodeHeight` holds them fixed.
-        """
+        """True when ``edge`` terminates at a leaf (tip) node."""
         return net.out_degree(edge.dest) == 0
 
     def execute(self, model: Model) -> Model:
-        """Slide a random internal node's height by a truncated-Gaussian delta.
-
-        Grows the node's parent branch(es) by ``delta`` and shrinks its
-        non-leaf child branch(es) by the same ``delta``, keeping every
-        adjusted branch length positive. See the class docstring for
-        why leaf (tip) branches are held fixed.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-                Uses ``model.rng`` to pick the node and draw ``delta``.
-
-        Returns:
-            The same ``model``, with the network mutated in place (or
-            left unchanged if no node has a feasible slide range).
-        """
-        net: Network = model.network
-
-        candidates = [
-            n for n in net.V()
-            if net.out_degree(n) > 0 and net.in_degree(n) > 0
-        ]
-        if not candidates:
-            model.update_network()
-            return model
-
-        rng = model.rng
-        node = _rng_pick(rng, candidates)
-        # Parent edges always terminate at an internal node (``node``),
-        # so they are never leaf branches and are always adjustable.
-        parent_edges = list(net.in_edges(node))
-        # Restrict the downward (``-delta``) adjustment to child edges
-        # that terminate at internal nodes.  Leaf branches are held
-        # fixed (see ``_is_leaf_edge``): they are non-identifiable under
-        # the MSC, so optimising them only wastes proposal budget.  A
-        # node whose children are all tips (a cherry) therefore reduces
-        # to a pure perturbation of its internal parent branch -- which
-        # *is* identifiable -- rather than being skipped entirely.
-        child_edges = [
-            e for e in net.out_edges(node)
-            if not self._is_leaf_edge(net, e)
-        ]
-
-        if not parent_edges:
-            model.update_network()
-            return model
-
-        min_parent_len = min(e.get_length() for e in parent_edges)
-
-        # ``delta > 0`` grows parent branches and shrinks internal child
-        # branches; ``delta < 0`` does the reverse.  The feasible range
-        # keeps every *adjusted* branch above ``_EPSILON``.
-        has_child_edges = bool(child_edges)
-        min_child_len = (
-            min(e.get_length() for e in child_edges) if has_child_edges else None
+        """Slide a random internal node's height by a truncated-Gaussian delta."""
+        self._log_hr, touched, changes = _core.mv_change_node_height(
+            model.network, model.rng, self._sigma_frac,
         )
-        lower = -(min_parent_len - self._EPSILON)
-        if has_child_edges:
-            upper = min_child_len - self._EPSILON
-        else:
-            # Cherry node: no internal children compensate the slide, so
-            # only the parent branch changes.  Bound the growth by the
-            # parent length to keep the proposal scale local.
-            upper = min_parent_len - self._EPSILON
-
-        if lower >= upper:
+        if touched is None:
             model.update_network()
             return model
-
-        half_range = 0.5 * (upper - lower)
-        sigma = self._sigma_frac * half_range
-        delta = float(rng.normal(0.0, sigma))
-        if not (lower <= delta <= upper):
-            for _ in range(self._TRUNCATE_RETRIES):
-                delta = float(rng.normal(0.0, sigma))
-                if lower <= delta <= upper:
-                    break
-            else:
-                # Clip as a last resort.  Introduces a tiny bias toward
-                # the bounds but keeps the move structurally valid.
-                delta = max(lower, min(upper, delta))
-
-        # Reverse-move feasible window and proposal scale, evaluated on
-        # the *post*-move branch lengths (every parent grew by ``delta``,
-        # every internal child shrank by ``delta``).  The slide draw is
-        # symmetric but its truncated-Gaussian scale is state-dependent,
-        # so the proposal is mildly asymmetric; the shared helper folds
-        # the truncation-normaliser ratio into the log-Hastings term.
-        min_parent_len_post = min_parent_len + delta
-        lower_rev = -(min_parent_len_post - self._EPSILON)
-        if has_child_edges:
-            min_child_len_post = min_child_len - delta
-            upper_rev = min_child_len_post - self._EPSILON
-        else:
-            upper_rev = min_parent_len_post - self._EPSILON
-        sigma_rev = self._sigma_frac * 0.5 * (upper_rev - lower_rev)
-        if upper_rev > lower_rev and sigma > 0.0 and sigma_rev > 0.0:
-            try:
-                self._log_hr = _nm.gaussian_delta_log_hastings(
-                    delta=delta,
-                    sigma_fwd=sigma,
-                    sigma_rev=sigma_rev,
-                    lo_fwd=lower,
-                    hi_fwd=upper,
-                    lo_rev=lower_rev,
-                    hi_rev=upper_rev,
-                )
-            except ValueError:
-                self._log_hr = 0.0
-
-        edge_changes: list[tuple[str, str, float, float]] = []
-        for e in parent_edges:
-            old_len = e.get_length()
-            new_len = old_len + delta
-            edge_changes.append((e.src.label, e.dest.label, old_len, new_len))
-            e.set_length(new_len)
-        for e in child_edges:
-            old_len = e.get_length()
-            new_len = old_len - delta
-            edge_changes.append((e.src.label, e.dest.label, old_len, new_len))
-            e.set_length(new_len)
-
-        self.undo_info = edge_changes
-        self.same_move_info = edge_changes
-        self._touched_label = node.label
+        self.undo_info = changes
+        self.same_move_info = changes
+        self._touched_label = touched
         model.mark_touched(self.touched_nodes(model.network))
         return model
 
     def undo(self, model: Model) -> None:
-        """Restore every edge length changed in ``execute`` to its old value.
-
-        Resolves edges by node label (rather than by object identity)
-        since ``model`` may be a fresh clone.
-        """
+        """Restore every edge length changed in ``execute`` to its old value."""
         net: Network = model.network
         if self.undo_info is not None:
             for src_lbl, dest_lbl, old_len, _new_len in self.undo_info:
@@ -1628,11 +777,7 @@ class ChangeNodeHeight(Move):
         model.mark_touched(self.touched_nodes(model.network))
 
     def same_move(self, model: Model) -> None:
-        """Re-apply the same edge-length deltas to a cloned ``model``.
-
-        Resolves edges by node label so the replay works on a
-        topologically-equivalent clone with distinct node objects.
-        """
+        """Re-apply the same edge-length deltas to a cloned ``model``."""
         net: Network = model.network
         if self.same_move_info is not None:
             for src_lbl, dest_lbl, _old_len, new_len in self.same_move_info:
@@ -1643,13 +788,7 @@ class ChangeNodeHeight(Move):
         model.mark_touched(self.touched_nodes(model.network))
 
     def touched_nodes(self, net: Network) -> "set[Node] | None":
-        """Return the single node whose height changed.
-
-        Sliding one internal node by a Gaussian delta only modifies
-        its incident parent / child branch lengths.  For the MCMC_GT
-        engine this means only the DP partials on the touched node's
-        ancestor-to-root path need recomputation.
-        """
+        """Return the single node whose height changed."""
         label = getattr(self, "_touched_label", None)
         if label is None:
             return None
@@ -1665,8 +804,7 @@ class ChangeInheritanceProb(Move):
     The two parent edges of a reticulation always carry complementary
     gammas (gamma and 1-gamma).  The new value is drawn from a
     Gaussian centered on the current gamma, truncated to (epsilon,
-    1-epsilon), so proposals stay close to the current value and
-    accept more often than a flat Uniform(0, 1) draw.
+    1-epsilon).
     """
 
     _SIGMA = 0.1
@@ -1686,83 +824,21 @@ class ChangeInheritanceProb(Move):
             self._sigma = self._SIGMA
 
     def execute(self, model: Model) -> Model:
-        """Perturb the gamma of a random reticulation's two parent edges.
-
-        Draws a new gamma from a Gaussian centered on the current value,
-        truncated to ``(_EPS, 1 - _EPS)``, and sets the two complementary
-        parent-edge gammas to ``new_g1`` / ``1 - new_g1``.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-                Uses ``model.rng`` to pick the reticulation and draw the
-                new gamma.
-
-        Returns:
-            The same ``model``, with the network mutated in place (or
-            left unchanged if there is no eligible reticulation or the
-            truncated draw could not land in bounds).
-        """
-        net: Network = model.network
-
-        retic_nodes = [
-            n for n in net.V() if net.in_degree(n) == 2 and n.is_reticulation()
-        ]
-        if not retic_nodes:
+        """Perturb the gamma of a random reticulation's two parent edges."""
+        self._log_hr, touched, undo, same = _core.mv_change_inheritance_prob(
+            model.network, model.rng, self._sigma,
+        )
+        if touched is None:
             model.update_network()
             return model
-
-        rng = model.rng
-        node = _rng_pick(rng, retic_nodes)
-        parent_edges = list(net.in_edges(node))
-        if len(parent_edges) != 2:
-            model.update_network()
-            return model
-
-        e1, e2 = parent_edges
-        old_g1 = e1.get_gamma()
-        old_g2 = e2.get_gamma()
-
-        current = old_g1 if old_g1 is not None else 0.5
-        lo, hi = self._EPS, 1.0 - self._EPS
-        # Truncated-Gaussian random walk on gamma: resample (rather than
-        # clamp) so the proposal really is a truncated normal, and fold
-        # the truncation-normaliser ratio into the log-Hastings term.
-        # Clamping piled proposal mass on the endpoints and used a
-        # Hastings ratio of 1, biasing inheritance probabilities toward
-        # 0/1.
-        new_g1 = float(rng.normal(current, self._sigma))
-        if not (lo < new_g1 < hi):
-            for _ in range(8):
-                new_g1 = float(rng.normal(current, self._sigma))
-                if lo < new_g1 < hi:
-                    break
-            else:
-                # Could not land in-bounds; leave gamma unchanged (no-op).
-                model.update_network()
-                return model
-        e1.set_gamma(new_g1)
-        e2.set_gamma(1.0 - new_g1)
-        try:
-            self._log_hr = _nm.random_walk_truncated_log_hastings(
-                old=current, new=new_g1, sigma=self._sigma, lo=lo, hi=hi
-            )
-        except ValueError:
-            self._log_hr = 0.0
-
-        self.undo_info = (e1.src.label, e1.dest.label, old_g1,
-                          e2.src.label, e2.dest.label, old_g2)
-        self.same_move_info = (e1.src.label, e1.dest.label, new_g1,
-                               e2.src.label, e2.dest.label, 1.0 - new_g1)
-        self._touched_label = node.label
+        self.undo_info = undo
+        self.same_move_info = same
+        self._touched_label = touched
         model.mark_touched(self.touched_nodes(model.network))
         return model
 
     def undo(self, model: Model) -> None:
-        """Restore both parent edges' gammas to their pre-``execute`` values.
-
-        Resolves edges by node label (rather than by object identity)
-        since ``model`` may be a fresh clone.
-        """
+        """Restore both parent edges' gammas to their pre-``execute`` values."""
         net: Network = model.network
         if self.undo_info is not None:
             s1, d1, g1, s2, d2, g2 = self.undo_info
@@ -1775,11 +851,7 @@ class ChangeInheritanceProb(Move):
         model.mark_touched(self.touched_nodes(model.network))
 
     def same_move(self, model: Model) -> None:
-        """Re-apply the same gamma change to a cloned ``model``.
-
-        Resolves edges by node label so the replay works on a
-        topologically-equivalent clone with distinct node objects.
-        """
+        """Re-apply the same gamma change to a cloned ``model``."""
         net: Network = model.network
         if self.same_move_info is not None:
             s1, d1, g1, s2, d2, g2 = self.same_move_info
@@ -1792,12 +864,7 @@ class ChangeInheritanceProb(Move):
         model.mark_touched(self.touched_nodes(model.network))
 
     def touched_nodes(self, net: Network) -> "set[Node] | None":
-        """Return the single reticulation whose inheritance prob changed.
-
-        Updating the gamma on one reticulation's two parent edges
-        only affects that node's incident branch weights -- the rest
-        of the per-network-edge partial cache can be reused.
-        """
+        """Return the single reticulation whose inheritance prob changed."""
         label = getattr(self, "_touched_label", None)
         if label is None:
             return None
@@ -1807,7 +874,7 @@ class ChangeInheritanceProb(Move):
         return {node}
 
 
-class ChangeReticSource(Move):
+class ChangeReticSource(_TransactionalMove):
     """Move the source (tail / parent) end of a reticulation edge.
 
     Picks a random reticulation edge ``z -> c``, detaches the source
@@ -1815,8 +882,6 @@ class ChangeReticSource(Move):
     orphan-chain pruning), then reattaches ``c``'s parent from a
     freshly-inserted node split into a randomly chosen host edge.
     Cycle-safe: host edges downstream of ``c`` are filtered out.
-
-    Uses deep-copy for undo/same_move to guarantee correctness.
     """
 
     def __init__(self, max_level: int | None = None) -> None:
@@ -1824,118 +889,30 @@ class ChangeReticSource(Move):
 
         Args:
             max_level: Optional cap on network level (``max_lvl`` search
-                flag).  If relocating the source raises the level above
-                this, the move self-reverts to a no-op.  ``None`` disables
-                the check.
+                flag).  ``None`` disables the check.
         """
         super().__init__()
         self._max_level = max_level
 
     def execute(self, model: Model) -> Model:
-        """Propose a source-relocation for one reticulation edge.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-
-        Returns:
-            The same ``model`` (mutated) for chaining convenience.
-        """
-        net: Network = model.network
-        net.begin_transaction()
+        """Propose a source-relocation for one reticulation edge."""
         self.undo_info = None
-
-        retic_edges = [e for e in net.E() if e.dest.is_reticulation()]
-        if not retic_edges:
+        self._log_hr, update = _core.mv_change_retic_source(
+            model.network, model.rng, self._max_level,
+        )
+        if update:
             model.update_network()
-            return model
-
-        rng = model.rng
-        retic_edge = _rng_pick(rng, retic_edges)
-        z: Node = retic_edge.src
-        c: Node = retic_edge.dest
-        saved_gamma = retic_edge.get_gamma()
-        saved_length = retic_edge.get_length()
-
-        net.remove_edge(retic_edge)
-
-        # Detaching the source can leave ``z`` in an invalid state.
-        # Two cases:
-        #   - out_degree(z) == 0 (orphan internal): recursively prune
-        #     up the chain so scoring never sees the dead end.
-        #   - in=1 / out=1 (passthrough): collapse to a single edge.
-        if net.in_degree(z) > 0 and net.out_degree(z) == 0:
-            _prune_orphan_chain(net, z)
-        elif net.in_degree(z) == 1 and net.out_degree(z) == 1:
-            _suppress_deg2(net, z)
-
-        forbidden = set(net.edges_downstream_of_node(c))
-        forbidden.update(net.in_edges(c))
-        forbidden.update(net.out_edges(c))
-        eligible = [e for e in net.E() if e not in forbidden]
-
-        if not eligible:
-            model.network.rollback_transaction()
-            model.update_network()
-            self.undo_info = None
-            return model
-
-        host = _rng_pick(rng, eligible)
-        a, b = host.src, host.dest
-        z_new = net.add_uid_node()
-        host_len = host.get_length()
-        split = float(rng.random())
-
-        net.remove_edge(host)
-        net.add_edges(Edge(a, z_new, length=host_len * split))
-        net.add_edges(Edge(z_new, b, length=host_len * (1.0 - split)))
-        net.add_edges(Edge(z_new, c, length=saved_length, gamma=saved_gamma))
-
-        if net.in_degree(c) > 1:
-            c.set_is_reticulation(True)
-
-        if self._revert_if_exceeds_level(model):
-            return model
-
-        model.update_network()
         return model
 
-    def undo(self, model: Model) -> None:
-        """Restore the network from the deep-copy snapshot taken in ``execute``."""
-        model.network.rollback_transaction()
-        self.undo_info = None
-        model.update_network()
 
-    def same_move(self, model: Model) -> None:
-        """No-op: replay is not supported for deep-copy-based moves."""
-        pass
-
-
-class RelocateReticulation(Move):
+class RelocateReticulation(_TransactionalMove):
     """Atomically relocate a reticulation node end-to-end.
 
     Picks a random reticulation node, detaches both incoming edges
     and the single outgoing edge, cleans up any passthroughs or
     orphan chains left behind, and then reattaches a fresh
-    reticulation on two newly split host edges.
-
-    This is equivalent to ``ChangeReticSource + ChangeReticDest``
-    in a single atomic step, avoiding the deep likelihood valley
-    that would arise from the intermediate partially-detached
-    state.  Cycle-safe via a ``descendants_of_child`` filter on
-    host edges.
-
-    Uses deep-copy for undo to guarantee correctness.
-
-    Hastings ratio.  Like :class:`SPR`, the exact reverse density for a
-    whole-reticulation relocation on a non-ultrametric network (two
-    host-edge picks among state-dependent eligible sets, plus split
-    Jacobians) is impractical to compute robustly, so this move reports
-    ``log_hastings_ratio() == 0.0`` and is treated as an *optimisation*
-    move rather than part of the posterior-correct sampler kernel (see the
-    :class:`SPR` note).  The dimension-changing
-    :class:`AddReticulation` / :class:`RemoveReticulation` pair *does*
-    carry the shared reversible-jump ratio and is what the MH sampler
-    uses to change reticulation number.
+    reticulation on two newly split host edges.  Reports a
+    log-Hastings ratio of ``0.0`` (an optimisation move).
     """
 
     def __init__(self, max_level: int | None = None) -> None:
@@ -1943,170 +920,30 @@ class RelocateReticulation(Move):
 
         Args:
             max_level: Optional cap on network level (``max_lvl`` search
-                flag).  If the relocation moves a reticulation into an
-                already-occupied blob and raises the level above this, the
-                move self-reverts to a no-op.  ``None`` disables the check.
+                flag).  ``None`` disables the check.
         """
         super().__init__()
         self._max_level = max_level
 
     def execute(self, model: Model) -> Model:
-        """Propose a whole-reticulation relocation.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-
-        Returns:
-            The same ``model`` (mutated) for chaining convenience.
-        """
-        net: Network = model.network
-        net.begin_transaction()
+        """Propose a whole-reticulation relocation."""
         self.undo_info = None
-
-        retic_nodes = [n for n in net.V() if n.is_reticulation()]
-        if not retic_nodes:
-            model.update_network()
-            return model
-
-        rng = model.rng
-        retic = _rng_pick(rng, retic_nodes)
-        in_edges = list(net.in_edges(retic))
-        if len(in_edges) != 2:
-            model.update_network()
-            return model
-
-        children = net.get_children(retic)
-        if not children:
-            model.update_network()
-            return model
-        child = children[0]
-
-        e_child = net.get_edge(retic, child)
-        saved_child_len = (
-            e_child.get_length() if e_child is not None else None
+        self._log_hr, update = _core.mv_relocate_reticulation(
+            model.network, model.rng, self._max_level,
         )
-
-        saved_gammas = [e.get_gamma() for e in in_edges]
-        saved_lengths = [e.get_length() for e in in_edges]
-        old_parents = [e.src for e in in_edges]
-
-        net.remove_edge(e_child)
-        for e in in_edges:
-            net.remove_edge(e)
-
-        retic.set_is_reticulation(False)
-        net.remove_nodes(retic)
-
-        # Parents can repeat here when the retic is a "bubble" (both
-        # in-edges from the same node), and a recursive prune of the
-        # first occurrence may remove the parent before the second pass.
-        seen_parents: set = set()
-        for p in old_parents:
-            if p in seen_parents or p not in net.V():
-                continue
-            seen_parents.add(p)
-            if net.in_degree(p) > 0 and net.out_degree(p) == 0:
-                _prune_orphan_chain(net, p)
-            elif net.in_degree(p) == 1 and net.out_degree(p) == 1:
-                _suppress_deg2(net, p)
-
-        if net.in_degree(child) == 1 and net.out_degree(child) == 1:
-            if not child.is_reticulation():
-                _suppress_deg2(net, child)
-
-        # Cycle-safety filter.  After the move we insert z1 on host1 and
-        # z2 on host2, and wire z1/z2 -> new_retic -> child.  A cycle
-        # forms iff ``child`` can reach z1 or z2, which happens iff a1
-        # or a2 is a descendant of ``child``.  Forbid any host edge
-        # whose source is reachable from ``child`` -- this is the same
-        # check ``ChangeReticSource`` uses and is the fix for the
-        # previous ``downstream_of_b1`` filter, which was filtering
-        # against the wrong anchor and let ~20% of proposals produce
-        # cyclic networks in realistic topologies.
-        forbidden = set(net.edges_downstream_of_node(child))
-        eligible = [e for e in net.E() if e not in forbidden]
-        if len(eligible) < 2:
-            model.network.rollback_transaction()
+        if update:
             model.update_network()
-            self.undo_info = None
-            return model
-
-        host1 = _rng_pick(rng, eligible)
-        a1, b1 = host1.src, host1.dest
-
-        eligible2 = [e for e in eligible if e is not host1]
-        if not eligible2:
-            model.network.rollback_transaction()
-            model.update_network()
-            self.undo_info = None
-            return model
-
-        host2 = _rng_pick(rng, eligible2)
-        a2, b2 = host2.src, host2.dest
-
-        new_retic = net.add_uid_node()
-        new_retic.set_is_reticulation(True)
-
-        z1 = net.add_uid_node()
-        h1_len = host1.get_length()
-        split1 = float(rng.random())
-        net.remove_edge(host1)
-        net.add_edges(Edge(a1, z1, length=(h1_len or 0) * split1))
-        net.add_edges(Edge(z1, b1, length=(h1_len or 0) * (1 - split1)))
-
-        z2 = net.add_uid_node()
-        h2_len = host2.get_length()
-        split2 = float(rng.random())
-        try:
-            net.remove_edge(host2)
-        except Exception:
-            # Defensive: if host2 was somehow invalidated by host1's
-            # split, fall back cleanly rather than leaving a partial
-            # edit.  With the ``descendants_of_child`` filter above this
-            # path is not expected to fire, but we keep the fallback
-            # for robustness.
-            model.network.rollback_transaction()
-            model.update_network()
-            self.undo_info = None
-            return model
-        net.add_edges(Edge(a2, z2, length=(h2_len or 0) * split2))
-        net.add_edges(Edge(z2, b2, length=(h2_len or 0) * (1 - split2)))
-
-        net.add_edges(Edge(z1, new_retic,
-                           length=saved_lengths[0], gamma=saved_gammas[0]))
-        net.add_edges(Edge(z2, new_retic,
-                           length=saved_lengths[1], gamma=saved_gammas[1]))
-
-        net.add_edges(Edge(new_retic, child, length=saved_child_len))
-
-        if self._revert_if_exceeds_level(model):
-            return model
-
-        model.update_network()
         return model
 
-    def undo(self, model: Model) -> None:
-        """Restore the network from the deep-copy snapshot taken in ``execute``."""
-        model.network.rollback_transaction()
-        self.undo_info = None
-        model.update_network()
 
-    def same_move(self, model: Model) -> None:
-        """No-op: replay is not supported for deep-copy-based moves."""
-        pass
-
-
-class ChangeReticDest(Move):
+class ChangeReticDest(_TransactionalMove):
     """Move the destination (head) end of a reticulation edge.
 
     Picks a random reticulation edge ``z -> c``, detaches the
     destination end, clears ``c``'s reticulation flag and collapses
     it if it became a deg-2 passthrough, then reattaches into a
     freshly-inserted reticulation node split onto a randomly chosen
-    host edge.  Cycle-safe: edges upstream of ``z`` are filtered
-    out.
-
-    Uses deep-copy for undo/same_move to guarantee correctness.
+    host edge.  Cycle-safe: edges upstream of ``z`` are filtered out.
     """
 
     def __init__(self, max_level: int | None = None) -> None:
@@ -2114,94 +951,17 @@ class ChangeReticDest(Move):
 
         Args:
             max_level: Optional cap on network level (``max_lvl`` search
-                flag).  If relocating the destination raises the level
-                above this, the move self-reverts to a no-op.  ``None``
-                disables the check.
+                flag).  ``None`` disables the check.
         """
         super().__init__()
         self._max_level = max_level
 
     def execute(self, model: Model) -> Model:
-        """Propose a destination-relocation for one reticulation edge.
-
-        Args:
-            model: Model whose ``network`` will be mutated in place.
-
-        Returns:
-            The same ``model`` (mutated) for chaining convenience.
-        """
-        net: Network = model.network
-        net.begin_transaction()
+        """Propose a destination-relocation for one reticulation edge."""
         self.undo_info = None
-
-        retic_edges = [e for e in net.E() if e.dest.is_reticulation()]
-        if not retic_edges:
+        self._log_hr, update = _core.mv_change_retic_dest(
+            model.network, model.rng, self._max_level,
+        )
+        if update:
             model.update_network()
-            return model
-
-        rng = model.rng
-        retic_edge = _rng_pick(rng, retic_edges)
-        z: Node = retic_edge.src
-        c: Node = retic_edge.dest
-        saved_gamma = retic_edge.get_gamma()
-        saved_length = retic_edge.get_length()
-
-        net.remove_edge(retic_edge)
-
-        if net.in_degree(c) <= 1:
-            c.set_is_reticulation(False)
-        if net.in_degree(c) == 1 and net.out_degree(c) == 1:
-            _suppress_deg2(net, c)
-
-        forbidden = set(net.edges_upstream_of_node(z))
-        forbidden.update(net.in_edges(z))
-        forbidden.update(net.out_edges(z))
-        eligible = [e for e in net.E() if e not in forbidden]
-
-        if not eligible:
-            model.network.rollback_transaction()
-            model.update_network()
-            self.undo_info = None
-            return model
-
-        host = _rng_pick(rng, eligible)
-        a, b = host.src, host.dest
-        c_new = net.add_uid_node()
-        c_new.set_is_reticulation(True)
-        host_len = host.get_length()
-        split = float(rng.random())
-
-        # Reticulation invariant: the two in-edges of ``c_new`` must
-        # carry inheritance probabilities that sum to 1.0.  We
-        # preserve ``saved_gamma`` on the redirected source edge
-        # ``z -> c_new`` and assign the complementary mass to the
-        # new tree-derived in-edge ``a -> c_new``.  Falling back to
-        # 0.5 when ``saved_gamma`` is None handles malformed inputs
-        # without crashing.  Without this, the AC DP scores ``c_new``
-        # with a one-sided gamma split that sends every proposal to
-        # the log floor (root-cause of the historical 0% accept rate
-        # for this move; verified by ``runs/diag_retic_fix_proof.py``).
-        sg = saved_gamma if saved_gamma is not None else 0.5
-        gamma_a = max(0.0, min(1.0, 1.0 - sg))
-
-        net.remove_edge(host)
-        net.add_edges(Edge(a, c_new, length=host_len * split, gamma=gamma_a))
-        net.add_edges(Edge(c_new, b, length=host_len * (1.0 - split)))
-        net.add_edges(Edge(z, c_new, length=saved_length, gamma=sg))
-
-        if self._revert_if_exceeds_level(model):
-            return model
-
-        model.update_network()
         return model
-
-    def undo(self, model: Model) -> None:
-        """Restore the network from the deep-copy snapshot taken in ``execute``."""
-        model.network.rollback_transaction()
-        self.undo_info = None
-        model.update_network()
-
-    def same_move(self, model: Model) -> None:
-        """No-op: replay is not supported for deep-copy-based moves."""
-        pass
-

@@ -53,6 +53,12 @@ runs the pure-Rust unit tests.
   (`network_error`, `node_error`, `edge_error`, `newick_error`) or standard
   ones (`PyValueError::new_err`). Warnings: `crate::util::warn(py, msg)?`.
 - Float formatting that users see must match Python (`py_float_repr`).
+- Never let Rust panic on a Python-reachable path. The search drivers catch
+  `Exception` from moves and scorers and treat the proposal as invalid; a
+  panic surfaces as `PanicException` (a `BaseException`) and aborts the run.
+  Index maps with `.get()` and return a `PyErr` (`network_error`,
+  `PyValueError`) where the reference raised, and tolerate stale ids where
+  the reference read a stale `Node`/`Edge` object.
 - Commit on your branch when done, with a message that says what moved to
   Rust, ending with `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 

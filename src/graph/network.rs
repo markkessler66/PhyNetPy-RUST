@@ -836,7 +836,7 @@ impl Network {
         self.journal.commit();
     }
 
-    fn rollback_transaction(slf: &Bound<'_, Self>) -> PyResult<()> {
+    pub fn rollback_transaction(slf: &Bound<'_, Self>) -> PyResult<()> {
         let py = slf.py();
         let journal = slf.borrow().journal.clone();
         let Some(frame) = journal.pop_for_rollback() else {
@@ -1687,7 +1687,7 @@ impl Network {
 impl Network {
     /// Shared body of ``edges_to_subgenome_count`` / ``subgenome_ct_edges``:
     /// ``(count, [edge ids])`` buckets in first-seen order.
-    fn subgenome_buckets(
+    pub(crate) fn subgenome_buckets(
         &self,
         py: Python<'_>,
         downstream_node: Option<&Bound<'_, PyAny>>,

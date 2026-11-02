@@ -62,6 +62,8 @@ from __future__ import annotations
 import math
 import warnings
 
+from . import _core
+
 __all__ = [
     "add_reticulation_log_hastings",
     "remove_reticulation_log_hastings",
@@ -152,47 +154,15 @@ def add_reticulation_log_hastings(
 ) -> float:
     r"""Log Hastings ratio (incl. RJ Jacobian) for adding a reticulation.
 
-    Two distinct edges are picked uniformly without replacement from the
-    pre-move network (a *donor* edge of length ``l1`` and a *reticulation*
-    edge of length ``l2``); each is split at a uniformly drawn point and a
-    hybrid edge with ``gamma ~ U(0, 1)`` is inserted.  The log Hastings
-    ratio is
+    ``log(pda * l1 * l2 * E (E - 1) / (2 (R + 1)))`` with ``E`` the pre-move
+    edge count, ``R`` the pre-move reticulation count and ``pda = 0.5``
+    only when adding the first reticulation.
 
-    .. math::
-
-        \log\!\Big( \mathrm{pda} \cdot l_1 \cdot l_2 \cdot
-                    \frac{E (E - 1)}{2 (R + 1)} \Big)
-
-    where ``E`` is the pre-move edge count, ``R`` the pre-move reticulation
-    count, and ``pda = 0.5`` only when adding the first reticulation
-    (``R == 0``), else ``1.0``.
-
-    Args:
-        edge_count_pre: ``E``, number of edges before the move.
-        retic_count_pre: ``R``, number of reticulations before the move.
-        l1: Length of the donor edge that was split.
-        l2: Length of the reticulation edge that was split.
-
-    Returns:
-        The log Hastings ratio.  ``-inf`` is never returned; callers must
-        reject degenerate (non-positive ``l1`` / ``l2`` or ``E < 2``)
-        proposals *before* calling this.
+    Raises:
+        ValueError: If ``E < 2`` or either length is not positive.
     """
-    E = int(edge_count_pre)
-    R = int(retic_count_pre)
-    if E < 2 or l1 <= 0.0 or l2 <= 0.0:
-        raise ValueError(
-            "add_reticulation_log_hastings requires E >= 2 and positive "
-            f"l1, l2 (got E={E}, l1={l1}, l2={l2})."
-        )
-    pda = 0.5 if R == 0 else 1.0
-    return (
-        math.log(pda)
-        + math.log(l1)
-        + math.log(l2)
-        + math.log(E)
-        + math.log(E - 1)
-        - math.log(2.0 * (R + 1))
+    return _core.add_reticulation_log_hastings_py(
+        int(edge_count_pre), int(retic_count_pre), float(l1), float(l2)
     )
 
 
@@ -202,107 +172,41 @@ def remove_reticulation_log_hastings(
     r"""Log Hastings ratio (incl. RJ Jacobian) for deleting a reticulation.
 
     Exact negative of :func:`add_reticulation_log_hastings` evaluated at the
-    reverse-add quantities:
+    reverse-add quantities: ``log(pad * 2 R / (l1 l2 E' (E' - 1)))`` with
+    ``pad = 2`` only when removing the last reticulation.
 
-    .. math::
-
-        \log\!\Big( \mathrm{pad} \cdot \frac{2 R}
-                    {l_1 \cdot l_2 \cdot E'(E' - 1)} \Big)
-
-    where ``R`` is the pre-move reticulation count, ``E'`` the *post*-move
-    edge count, ``l1`` / ``l2`` the lengths of the two edges that result
-    from suppressing the degree-2 nodes left by the deletion (i.e. the two
-    edges a reverse add would re-split), and ``pad = 2`` only when removing
-    the last reticulation (``R == 1``), else ``1.0``.
-
-    Args:
-        edge_count_post: ``E'``, number of edges after the move.
-        retic_count_pre: ``R``, number of reticulations before the move.
-        l1: Length of the first merged edge.
-        l2: Length of the second merged edge.
-
-    Returns:
-        The log Hastings ratio.
+    Raises:
+        ValueError: If ``E' < 2``, ``R < 1`` or either length is not positive.
     """
-    Ep = int(edge_count_post)
-    R = int(retic_count_pre)
-    if Ep < 2 or R < 1 or l1 <= 0.0 or l2 <= 0.0:
-        raise ValueError(
-            "remove_reticulation_log_hastings requires E' >= 2, R >= 1 and "
-            f"positive l1, l2 (got E'={Ep}, R={R}, l1={l1}, l2={l2})."
-        )
-    pad = 2.0 if R == 1 else 1.0
-    return (
-        math.log(pad)
-        + math.log(2.0 * R)
-        - math.log(l1)
-        - math.log(l2)
-        - math.log(Ep)
-        - math.log(Ep - 1)
+    return _core.remove_reticulation_log_hastings_py(
+        int(edge_count_post), int(retic_count_pre), float(l1), float(l2)
     )
-
-
-# ======================================================================
-# Truncated-Gaussian random-walk helpers (bounded continuous parameters)
-# ======================================================================
 
 
 def normal_log_pdf(x: float, mu: float, sigma: float) -> float:
     """Log density of ``N(mu, sigma^2)`` evaluated at ``x``."""
-    if sigma <= 0.0:
-        raise ValueError(f"sigma must be positive (got {sigma}).")
-    z = (x - mu) / sigma
-    return -0.5 * z * z - math.log(sigma) - _LOG_SQRT_2PI
+    return _core.normal_log_pdf_py(float(x), float(mu), float(sigma))
 
 
 def standard_normal_cdf(x: float) -> float:
-    """Standard-normal CDF ``Phi(x)`` (via ``math.erf``; no SciPy needed)."""
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+    """Standard-normal CDF ``Phi(x)``."""
+    return _core.standard_normal_cdf_py(float(x))
 
 
 def truncated_normal_log_norm(
     mu: float, sigma: float, lo: float, hi: float
 ) -> float:
-    r"""Log normalising constant of ``N(mu, sigma^2)`` truncated to ``[lo, hi]``.
-
-    ``Z = Phi((hi - mu)/sigma) - Phi((lo - mu)/sigma)``.  This is the term
-    that makes a clamped/reflected Gaussian random walk into a *proper*
-    truncated-Gaussian proposal: the Hastings ratio of such a walk is the
-    ratio of these normalisers at the current vs proposed centre.
-    """
-    if sigma <= 0.0:
-        raise ValueError(f"sigma must be positive (got {sigma}).")
-    if hi <= lo:
-        raise ValueError(f"require hi > lo (got lo={lo}, hi={hi}).")
-    z = standard_normal_cdf((hi - mu) / sigma) - standard_normal_cdf(
-        (lo - mu) / sigma
-    )
-    # Guard against catastrophic cancellation in the deep tails.
-    z = max(z, 1e-300)
-    return math.log(z)
+    r"""Log normalising constant of ``N(mu, sigma^2)`` truncated to ``[lo, hi]``."""
+    return _core.truncated_normal_log_norm_py(float(mu), float(sigma), float(lo), float(hi))
 
 
 def random_walk_truncated_log_hastings(
     *, old: float, new: float, sigma: float, lo: float, hi: float
 ) -> float:
-    r"""Log Hastings ratio for a truncated-Gaussian random walk on ``[lo, hi]``.
-
-    Proposal ``q(new | old) = N(new; old, sigma^2) / Z(old)`` truncated to
-    ``[lo, hi]`` (and symmetrically for the reverse).  The Gaussian kernel
-    is symmetric, so the Hastings ratio collapses to the ratio of the
-    truncation normalisers:
-
-    .. math::
-
-        \log\frac{q(\text{old}\mid\text{new})}{q(\text{new}\mid\text{old})}
-        = \log Z(\text{old}) - \log Z(\text{new}).
-
-    This is the correct replacement for the old "draw a Gaussian, clamp to
-    the bounds" behaviour, which piled proposal mass on the endpoints and
-    used a Hastings ratio of 1.
-    """
-    return truncated_normal_log_norm(old, sigma, lo, hi) - truncated_normal_log_norm(
-        new, sigma, lo, hi
+    r"""Log Hastings ratio for a truncated-Gaussian random walk on ``[lo, hi]``:
+    ``log Z(old) - log Z(new)``."""
+    return _core.random_walk_truncated_log_hastings_py(
+        float(old), float(new), float(sigma), float(lo), float(hi)
     )
 
 
@@ -316,67 +220,19 @@ def gaussian_delta_log_hastings(
     lo_rev: float,
     hi_rev: float,
 ) -> float:
-    r"""Log Hastings ratio for a symmetric-delta slide with state-dependent scale.
-
-    Models the :class:`phynetpy.ModelMove.ChangeNodeHeight` proposal: a node
-    is shifted by ``delta`` drawn from ``N(0, sigma_fwd^2)`` truncated to the
-    forward feasible window ``[lo_fwd, hi_fwd]``.  The matching reverse move
-    shifts by ``-delta`` drawn from ``N(0, sigma_rev^2)`` truncated to the
-    *post*-move feasible window ``[lo_rev, hi_rev]`` (the scale and window
-    both depend on the current state, so the proposal is only *mildly*
-    asymmetric -- but not exactly symmetric, which is why a ratio of 1 was
-    wrong).
-
-    .. math::
-
-        \log\frac{q_\text{rev}(-\delta)}{q_\text{fwd}(\delta)}
-        = \big[\log N(\delta;0,\sigma_r) - \log Z_r\big]
-        - \big[\log N(\delta;0,\sigma_f) - \log Z_f\big].
-    """
-    log_q_rev = normal_log_pdf(delta, 0.0, sigma_rev) - truncated_normal_log_norm(
-        0.0, sigma_rev, lo_rev, hi_rev
+    r"""Log Hastings ratio for a symmetric-delta slide with state-dependent
+    scale (the :class:`phynetpy.ModelMove.ChangeNodeHeight` proposal)."""
+    return _core.gaussian_delta_log_hastings_py(
+        float(delta), float(sigma_fwd), float(sigma_rev),
+        float(lo_fwd), float(hi_fwd), float(lo_rev), float(hi_rev),
     )
-    log_q_fwd = normal_log_pdf(delta, 0.0, sigma_fwd) - truncated_normal_log_norm(
-        0.0, sigma_fwd, lo_fwd, hi_fwd
-    )
-    return log_q_rev - log_q_fwd
-
-
-# ======================================================================
-# Discrete weighted selection (SPR regraft, edge picks)
-# ======================================================================
 
 
 def weighted_choice_log_hastings(
     *, fwd_weight: float, fwd_total: float, rev_weight: float, rev_total: float
 ) -> float:
-    r"""Log Hastings ratio for an asymmetric weighted discrete choice.
-
-    When a move selects an option with forward probability
-    ``fwd_weight / fwd_total`` and the reverse move would select the
-    inverse option with probability ``rev_weight / rev_total``, the
-    selection contributes
-
-    .. math::
-
-        \log\frac{p_\text{rev}}{p_\text{fwd}}
-        = \log\frac{\text{rev\_weight} / \text{rev\_total}}
-                   {\text{fwd\_weight} / \text{fwd\_total}}.
-
-    Used by :class:`phynetpy.ModelMove.SPR`, whose distance-weighted
-    regraft is genuinely asymmetric.  Passing equal weights (uniform
-    regraft) with equal totals yields ``0.0`` -- the symmetric special
-    case.
-    """
-    if fwd_weight <= 0.0 or rev_weight <= 0.0 or fwd_total <= 0.0 or rev_total <= 0.0:
-        raise ValueError(
-            "weighted_choice_log_hastings requires strictly positive weights "
-            f"and totals (got fwd={fwd_weight}/{fwd_total}, "
-            f"rev={rev_weight}/{rev_total})."
-        )
-    return (
-        math.log(rev_weight)
-        - math.log(rev_total)
-        - math.log(fwd_weight)
-        + math.log(fwd_total)
+    r"""Log Hastings ratio for an asymmetric weighted discrete choice:
+    ``log((rev_weight / rev_total) / (fwd_weight / fwd_total))``."""
+    return _core.weighted_choice_log_hastings_py(
+        float(fwd_weight), float(fwd_total), float(rev_weight), float(rev_total)
     )

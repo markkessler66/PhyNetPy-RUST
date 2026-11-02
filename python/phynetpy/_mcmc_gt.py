@@ -521,7 +521,8 @@ class _GTLikelihoodEngine(MSCBranchKernel):
                 the dirty-set protocol so the engine can invalidate
                 stale caches.
         """
-        super().__init__(theta=2.0)
+        # The branch kernel is a compiled class; set its parameter directly.
+        self.theta = 2.0
         self.network = network
         # Int-indexed view of the species network used by the AC DP.
         # Built lazily on first ``log_prob`` call; rebuilt on topology
@@ -854,6 +855,8 @@ class _DisplayedTree:
         "_idx_leaves",
         "_idx_leaf_species",
         "_idx_root",
+        # Compiled index built lazily by the Rust tree DP.
+        "_rs_idx",
     )
 
     def __init__(
@@ -916,6 +919,7 @@ class _DisplayedTree:
             for l in leaves if l in idx_of and l in leaf_species
         }
         self._idx_root = idx_of.get(root, -1)
+        self._rs_idx = None
 
     @classmethod
     def from_network(

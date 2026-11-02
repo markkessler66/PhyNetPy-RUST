@@ -7,6 +7,7 @@
 use pyo3::prelude::*;
 
 pub mod graph;
+pub mod kernels;
 pub mod util;
 
 #[pymodule]
@@ -24,5 +25,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(util::_register_network_class, m)?)?;
     m.add_function(wrap_pyfunction!(graph::newick::parse_newick, m)?)?;
     m.add_function(wrap_pyfunction!(graph::newick::complete_hybrid_gammas_py, m)?)?;
+    kernels::msnc::register(m)?;
     Ok(())
 }

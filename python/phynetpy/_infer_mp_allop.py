@@ -21,9 +21,14 @@
 """
 Author: Mark Kessler
 
-Description: This file contains the method Infer_MP_Allop_2.0, which 
+Description: This file contains the method Infer_MP_Allop_2.0, which
 is a maximum parsimony approach to inferring phylogenetic networks that contain
 allopolyploid, polyploid, and autopolyploid species, given a set of gene trees.
+
+The numerical core -- MUL-tree construction, allele-map enumeration and the
+extra-lineage (deep coalescence) score of gene trees against a MUL tree --
+runs in the compiled core (``phynetpy._core``); this module keeps the public
+classes and the search glue.
 
 Last Edit: 3/4/26
 Included in version : 1.0.0
@@ -34,12 +39,11 @@ Design - [x]
 
 """
 from __future__ import annotations
-import copy
-from collections import defaultdict
 from typing import Any
 
 import numpy as np
 
+from . import _core
 from .Network import Network, Node, Edge, MUL, NetworkError
 from .BirthDeath import Yule
 from .ModelGraph import Model
@@ -74,20 +78,20 @@ https://academic.oup.com/sysbio/article/71/3/706/6380964
 """
 Clusters are represented a few different ways in this file.
 
-1) frozen set of strings 
+1) frozen set of strings
 2) frozen set of Nodes
-3) set of Nodes 
-4) set of strings 
+3) set of Nodes
+4) set of strings
 
 (where the strings are node names)
 
 
-The ILP (integer linear programming) Algorithm used to compute an MDC tree can 
+The ILP (integer linear programming) Algorithm used to compute an MDC tree can
 be found here:
 
 https://journals.plos.org/ploscompbiol/article?id=10.1371/journal.pcbi.1000501
 
-The rest of this file is based on the algorithms described here: 
+The rest of this file is based on the algorithms described here:
 
 https://academic.oup.com/sysbio/article/71/3/706/6380964
 
@@ -133,14 +137,14 @@ def _ploidy_dif(goal: dict[Node, int], cur: dict[Node, int]) -> bool:
         if cur[leaf] != goal[leaf]:
             return False
     return True
-    
+
 def _attach(net: Network,
             nti: dict[Node, int],
             goal_ploidy: dict[Node, int],
             rng: np.random.Generator = None) -> None:
     """
-    Given a set of nodes that need to be edited as to increase ploidy, add a 
-    hybrid edge in such a location as to increase the ploidy of a maximally 
+    Given a set of nodes that need to be edited as to increase ploidy, add a
+    hybrid edge in such a location as to increase the ploidy of a maximally
     sized set of nodes that need to be improved.
 
     Args:
@@ -160,32 +164,32 @@ def _attach(net: Network,
         clusters,
         key=lambda c: (-len(c), tuple(sorted(node.label for node in c))),
     )
-    
+
     def amt_allowed(cluster: tuple[Node], lti: dict) -> int:
         """Max ploidy gain a hybrid edge to ``cluster`` can give, bounded by its neediest member."""
         return min([lti[node] for node in cluster])
-    
+
     chosen_cluster = None
     ploidy_amt = 0
-    
+
     for candidate in sorted_clusters:
         max_ploidy = amt_allowed(candidate, nti)
         if max_ploidy > 0:
             chosen_cluster = candidate
             ploidy_amt = max_ploidy
             break
-    
+
     if chosen_cluster is None:
         raise InferAllopError("No clusters whose taxa needed more ploidy")
-    
+
     top_of_cluster: Node = net.mrca(set(chosen_cluster))
     valid_edges = net.subgenome_ct_edges(downstream_node=top_of_cluster,
                                          delta=ploidy_amt)
-    
+
     valid_edge_list = list(valid_edges.keys())
     if not valid_edge_list:
         raise InferAllopError("No valid edges for ploidy attachment")
-    
+
     src: Edge = random_object(valid_edge_list, rng if rng is not None else RNG)
     if top_of_cluster != net.root():
         in_edges = list(net.in_edges(top_of_cluster))
@@ -195,18 +199,18 @@ def _attach(net: Network,
             raise InferAllopError("top_of_cluster has no parent edges")
     else:
         raise NetworkError("Cannot attach hybrid at root")
-    
-         
+
+
 def _resolve_ploidy(net: Network,
                     subgenomes: dict[str, list[str]],
                     rng: np.random.Generator = None) -> Network:
     """
-    Given a tree and a subgenome mapping of network leaves to genes, add 
+    Given a tree and a subgenome mapping of network leaves to genes, add
     reticulation edges such that each leaf has the desired ploidy.
 
     Args:
         net (Network): A standard binary tree. Each leaf will have ploidy 1.
-        subgenomes (dict[str, list[str]]): A subgenome mapping. Maps names of 
+        subgenomes (dict[str, list[str]]): A subgenome mapping. Maps names of
                                            subgenomes to the gene names.
     Returns:
         Network: A reconciled network with correct ploidy.
@@ -215,22 +219,22 @@ def _resolve_ploidy(net: Network,
                   for node in net.get_leaves()}
     goal_ploidy = {node: len(subgenomes[node.label])
                    for node in net.get_leaves()}
-    
+
     max_iterations = 25
     iteration = 0
-   
+
     while not _ploidy_dif(goal_ploidy, cur_ploidy) and iteration < max_iterations:
         iteration += 1
-        
+
         lti: dict[Node, int] = {}
         for node in net.get_leaves():
             lti[node] = goal_ploidy[node] - cur_ploidy[node]
-        
+
         _attach(net, lti, goal_ploidy, rng=rng)
-       
+
         cur_ploidy = {node: net.subgenome_count(node)
                       for node in net.get_leaves()}
-    
+
     return net
 
 def random_object(mylist: list[Any], rng: np.random.Generator) -> object:
@@ -248,7 +252,7 @@ def random_object(mylist: list[Any], rng: np.random.Generator) -> object:
         return None
     rand_index: int = rng.integers(0, len(mylist))
     return mylist[rand_index]
-    
+
 def cluster_as_name_set(cluster: set[Node]) -> frozenset[str]:
     """
     Convert cluster from a set of nodes to a set of strings (names).
@@ -260,12 +264,12 @@ def cluster_as_name_set(cluster: set[Node]) -> frozenset[str]:
         frozenset[str]: The set of node names in the cluster.
     """
     return frozenset([node.label for node in cluster])
-    
+
 def clusters_contains(cluster: set[Node],
                       set_of_clusters: set[set[Node]]) -> bool:
     """
     Check if a cluster is in a set of clusters by checking names.
-    
+
     Args:
         cluster (set[Node]): a cluster
         set_of_clusters (set[set[Node]]): a set of clusters
@@ -282,13 +286,13 @@ def clusters_contains(cluster: set[Node],
 def cluster_partition(cluster: frozenset[Node],
                       processed: dict[set[Node], Node]) -> frozenset:
     """
-    Given a cluster such as ('A', 'B', 'C'), if a cluster such as ('A', 'B') 
-    has already been processed, split the original cluster into subsets -- 
+    Given a cluster such as ('A', 'B', 'C'), if a cluster such as ('A', 'B')
+    has already been processed, split the original cluster into subsets --
     {('A', 'B'), ('C')}.
 
     Args:
         cluster (frozenset[Node]): A cluster.
-        processed (dict[set[Node], Node]): A mapping from clusters to the Node 
+        processed (dict[set[Node], Node]): A mapping from clusters to the Node
                                            obj that is the root of that cluster.
 
     Returns:
@@ -296,18 +300,18 @@ def cluster_partition(cluster: frozenset[Node],
     """
     editable_cluster = set(cluster)
     new_cluster = set()
-    
+
     for subcluster in processed.keys():
         if subcluster.issubset(editable_cluster):
             new_cluster.add(subcluster)
             for item in subcluster:
                 editable_cluster.remove(item)
-    
+
     for item in editable_cluster:
         new_cluster.add(item)
-    
+
     return frozenset(new_cluster)
-          
+
 def generate_tree_from_clusters(tree_clusters: set[str]) -> Network:
     """
     Given a set of clusters (given by the taxa labels), reconstruct the tree
@@ -321,29 +325,29 @@ def generate_tree_from_clusters(tree_clusters: set[str]) -> Network:
     net: Network = Network()
     root: Node = Node(name="ROOT")
     net.add_nodes(root)
-    
+
     i = 2
     j = 1
     is_root = False
     processed_clusters: dict[set, Node] = {}
     root_children: list[Node] = []
-    
+
     while len(tree_clusters) != 0:
         clusters_len_i = [c for c in tree_clusters if len(c) == i]
-        
+
         if len(tree_clusters) == len(clusters_len_i):
             is_root = True
-            
+
         for cluster in clusters_len_i:
             cluster_parent = Node(name=f"Internal_{j}")
             net.add_nodes(cluster_parent)
             j += 1
-            
+
             if is_root:
                 root_children.append(cluster_parent)
-            
+
             partitioned_cluster = cluster_partition(cluster, processed_clusters)
-            
+
             for subtree in partitioned_cluster:
                 if type(subtree) == frozenset:
                     new_edge = Edge(cluster_parent, processed_clusters[subtree])
@@ -352,15 +356,15 @@ def generate_tree_from_clusters(tree_clusters: set[str]) -> Network:
                     taxa_node = Node(name=subtree)
                     net.add_nodes(taxa_node)
                     net.add_edges(Edge(cluster_parent, taxa_node))
-                
+
             processed_clusters[cluster] = cluster_parent
             tree_clusters.remove(cluster)
-        
+
         i += 1
 
-    for root_child in root_children:   
+    for root_child in root_children:
         net.add_edges(Edge(root, root_child))
-        
+
     return net
 
 def partition_gene_trees(gene_map: dict[str, list[str]],
@@ -369,7 +373,7 @@ def partition_gene_trees(gene_map: dict[str, list[str]],
     Generate a starting network given a subgenome mapping.
 
     Args:
-        gene_map (dict[str, list[str]]): Map from gene names to a list of 
+        gene_map (dict[str, list[str]]): Map from gene names to a list of
                                          copy names.
         rng (np.random.Generator): A random generator instance.
 
@@ -386,7 +390,7 @@ def partition_gene_trees(gene_map: dict[str, list[str]],
     for leaf in simple_network.get_leaves():
         simple_network.update_node_name(leaf, names[name_idx])
         name_idx += 1
-            
+
     return _resolve_ploidy(simple_network, gene_map, rng=rng)
 
 def get_other_copies(gene_tree_leaf: Node,
@@ -430,37 +434,28 @@ def get_other_copies(gene_tree_leaf: Node,
         f"list (map values)."
     )
 
+def _leaf_choices(g: Network,
+                  gene_map: dict[str, list[str]]) -> list[tuple[str, list[str]]]:
+    """The allele labels each leaf of ``g`` may map to, in leaf order."""
+    return [(gleaf.label, list(get_other_copies(gleaf, gene_map)))
+            for gleaf in g.get_leaves()]
+
 def allele_map_set(g: Network,
-                   gene_map: dict[str, list[str]]) -> list[AlleleMap]: 
+                   gene_map: dict[str, list[str]]) -> list[AlleleMap]:
     """
-    Let a MUL tree, T', have taxa labels drawn from the set X 
-    (keys of gene_map input dict). Calculate all possible mappings from taxa 
+    Let a MUL tree, T', have taxa labels drawn from the set X
+    (keys of gene_map input dict). Calculate all possible mappings from taxa
     labels of g (values of gene_map input dict) into X.
-    
+
     Args:
         g (Network): A gene tree
         gene_map (dict[str, list]): A taxon map.
 
     Returns:
-        list[AlleleMap]: a list of functions that map labels of g to 
+        list[AlleleMap]: a list of functions that map labels of g to
                          labels of a MUL tree.
     """
-    funcs: list[AlleleMap] = [AlleleMap()]
-    
-    for gleaf in g.get_leaves():
-        new_funcs = []
-        other_copies = get_other_copies(gleaf, gene_map)
-        
-        for mul_leaf in other_copies:
-            copy_funcs = copy.deepcopy(funcs)
-            for func in copy_funcs:
-                status = func.put(gleaf, mul_leaf)
-                if status == 1:
-                    new_funcs.append(func)
-                
-        funcs = new_funcs  
-            
-    return funcs      
+    return _core._enumerate_allele_maps(_leaf_choices(g, gene_map))
 
 def allele_map_set_ilp(g: Network,
                        gene_map: dict[str, list[str]],
@@ -468,46 +463,67 @@ def allele_map_set_ilp(g: Network,
     """
     Compute valid allele maps using Integer Linear Programming.
     Falls back to brute-force enumeration if PuLP is not installed.
-    
+
+    The integer program only ever returns a subset of the valid maps when
+    there are more than ``max_solutions`` of them, so the maps are first
+    enumerated directly (in the compiled core); the solver is consulted only
+    when that enumeration exceeds ``max_solutions``.
+
     Args:
         g (Network): A gene tree
         gene_map (dict[str, list[str]]): A taxon map.
         max_solutions (int): Maximum number of solutions to find.
 
     Returns:
-        list[AlleleMap]: a list of functions that map labels of g to 
+        list[AlleleMap]: a list of functions that map labels of g to
                          labels of a MUL tree.
     """
     if not PULP_AVAILABLE:
         return allele_map_set(g, gene_map)
-    
+
+    maps = _core._enumerate_allele_maps(_leaf_choices(g, gene_map),
+                                        max_solutions)
+    if maps is not None:
+        if not maps:
+            raise InferAllopError("No valid allele map found")
+        return maps
+
+    return _allele_map_set_pulp(g, gene_map, max_solutions)
+
+def _allele_map_set_pulp(g: Network,
+                         gene_map: dict[str, list[str]],
+                         max_solutions: int = 10) -> list[AlleleMap]:
+    """
+    The integer-programming enumeration of up to ``max_solutions`` allele
+    maps (PuLP / CBC), used when more than ``max_solutions`` maps exist.
+    """
     gene_leaves = g.get_leaves()
     mul_leaves = set()
     for copies in gene_map.values():
         mul_leaves.update(copies)
-    
+
     x = LpVariable.dicts("map",
                          ((i.label, j) for i in gene_leaves for j in mul_leaves),
                          cat='Binary')
-    
+
     solutions = []
-    
+
     while len(solutions) < max_solutions:
         prob = LpProblem("Allele_Mapping", LpMaximize)
         prob += lpSum(x[i.label, j] for i in gene_leaves for j in mul_leaves)
-        
+
         for i in gene_leaves:
             prob += lpSum(x[i.label, j] for j in mul_leaves) == 1
-        
+
         for j in mul_leaves:
             prob += lpSum(x[i.label, j] for i in gene_leaves) <= 1
-        
+
         for i in gene_leaves:
             valid_mul_leaves = get_other_copies(i, gene_map)
             for j in mul_leaves:
                 if j not in valid_mul_leaves:
                     prob += x[i.label, j] == 0
-        
+
         for prev_solution in solutions:
             diff_constraint = []
             for i in gene_leaves:
@@ -517,23 +533,23 @@ def allele_map_set_ilp(g: Network,
                     else:
                         diff_constraint.append(x[i.label, j])
             prob += lpSum(diff_constraint) >= 1
-        
+
         prob.solve(PULP_CBC_CMD(msg=False))
-        
+
         if LpStatus[prob.status] != 'Optimal':
             break
-        
+
         allele_map = AlleleMap()
         for i in gene_leaves:
             for j in mul_leaves:
                 if value(x[i.label, j]) == 1:
                     allele_map.put(i, j)
-        
+
         solutions.append(allele_map)
-    
+
     if not solutions:
         raise InferAllopError("No valid allele map found")
-    
+
     return solutions
 
 ##############################
@@ -544,54 +560,48 @@ class Allop_MUL(MUL):
     """
     A Standard MUL tree with methods for calculating the maximum parsimony
     score for Infer_MP_Allop_2.0.
+
+    The MUL-tree construction and the parsimony traversal run in the
+    compiled core; ``self.mul`` is the current MUL tree (a Network).
     """
-    # Per-score caches (set in ``XL``); avoid recomputing the MUL leaf set
-    # and root inside the hot parsimony traversal.
+    # Per-score caches of the pure-Python traversal; kept for compatibility,
+    # the compiled traversal indexes the MUL tree itself.
     _mul_leaf_set: set = set()
     _mul_root = None
+
+    def to_mul(self, net: Network) -> Network:
+        """
+        Creates a (MU)lti-(L)abeled Species Tree from a network
+
+        Raises:
+            NetworkError: If the network is malformed with regards to ploidy
+        Args:
+            net (Network): A Network
+        Returns:
+            Network: a MUL tree (as a Network obj)
+        """
+        self.mul = _core._allop_to_mul(net, self.gene_map)
+        return self.mul
 
     def extra_lineages(self,
                        coal_event_map: dict[tuple, str],
                        f: AlleleMap) -> int:
         """
-        Computes the number of extra lineages in a mapping from a gene tree T, 
+        Computes the number of extra lineages in a mapping from a gene tree T,
         into a MUL tree, T'.
 
         Args:
-            coal_event_map (dict[tuple[str, str], str]): A mapping from edges in 
-                                                         T' to a list of nodes 
-                                                         of T that have been 
+            coal_event_map (dict[tuple[str, str], str]): A mapping from edges in
+                                                         T' to a list of nodes
+                                                         of T that have been
                                                          mapped into that edge.
             f (AlleleMap): An allele map.
 
         Returns:
             int: number of extra lineages
         """
-        edge_2_xl = {}
-        root = self._mul_root
-        
-        self.xl_helper(root, edge_2_xl, coal_event_map, f)
-        
-        root_xl = (edge_2_xl[(None, root.label)][0]
-                   - len(coal_event_map[(None, root.label)]) - 1)
-    
-        extra_lin_total = 0
-        mul_leaves = self._mul_leaf_set
-        
-        for edge in self.mul.E():
-            if edge.src is not None:
-                extra_lin_total += edge_2_xl[edge.to_names()][0] 
-                extra_lin_total -= 1
-                
-                if edge.dest in mul_leaves: 
-                    extra_lin_total -= 0
-                elif edge.dest is not None:
-                    extra_lin_total -= len(coal_event_map[edge.to_names()]) 
-    
-        extra_lin_total += root_xl 
-        
-        return extra_lin_total
-    
+        return _core._allop_extra_lineages(self.mul, coal_event_map, f)
+
     def xl_helper(self,
                   start_node: Node,
                   edge_xl_map: dict,
@@ -607,36 +617,8 @@ class Allop_MUL(MUL):
             coal_map (dict): Mapping from edges to gene tree internal node names
             f (AlleleMap): allele mapping
         """
-        fmap: dict[str, str] = f.map
-        
-        if start_node in self._mul_leaf_set:
-            par: Node = self.mul.get_parents(start_node)[0]
-            
-            if start_node.label in fmap.values():
-                edge_xl_map[(par.label, start_node.label)] = [1, 1] 
-            else:
-                edge_xl_map[(par.label, start_node.label)] = [0, 0] 
-        else:
-            if start_node == self._mul_root:
-                par = None
-            else:
-                par = self.mul.get_parents(start_node)[0]
-                
-            sum_of_child_tops = 0
-            
-            for child in self.mul.get_children(start_node):
-                self.xl_helper(child, edge_xl_map, coal_map, f)
-                e = (start_node.label, child.label)
-                sum_of_child_tops += edge_xl_map[e][1]
-            
-            par_name = par.label if par is not None else None
-                
-            bottom = sum_of_child_tops
-            coal_events = len(coal_map[(par_name, start_node.label)])
-            top = sum_of_child_tops - coal_events
-            
-            edge_xl_map[(par_name, start_node.label)] = [bottom, top]
-            
+        _core._allop_xl_helper(self.mul, start_node, edge_xl_map, coal_map, f)
+
     def gene_tree_map(self,
                       g: Network,
                       leaf_map: AlleleMap,
@@ -648,41 +630,13 @@ class Allop_MUL(MUL):
         Args:
             g (Network): The gene tree
             leaf_map (AlleleMap): Allele map from gene tree to MUL tree.
-            mrca_cache (dict): A cache for MRCA computations.
+            mrca_cache (dict): A cache for MRCA computations. Unused; the
+                               compiled core resolves MRCAs directly.
         Returns:
             dict[tuple, list[str]]: Mapping from edges in T' to gene tree nodes.
         """
-        edgeloc_2_tnode = defaultdict(list)
-        
-        gene_tree_leaves = g.get_leaves()
-        mul_root = self._mul_root
-        
-        leaf_desc_map = g.get_item("leaf descendants")
-        
-        for node in g.V():
-            if node not in gene_tree_leaves: 
-                c_t_ofv = leaf_desc_map[node]
+        return _core._allop_gene_tree_map(self.mul, g, leaf_map)
 
-                cluster_names = [leaf_map.map[leaf.label]
-                                 for leaf in c_t_ofv]
-                cluster = frozenset(cluster_names)
-                
-                try:
-                    v_prime: Node = mrca_cache[cluster]
-                except KeyError:
-                    v_prime: Node = self.mul.mrca(cluster)
-                    mrca_cache[cluster] = v_prime
-                
-                if v_prime == mul_root:
-                    e = (None, v_prime.label)
-                else:
-                    u_prime: Node = self.mul.get_parents(v_prime)[0]
-                    e = (u_prime.label, v_prime.label)
-                
-                edgeloc_2_tnode[e].append(node.label)
-        
-        return edgeloc_2_tnode
-            
     def XL(self, g: Network, mrca_cache: dict[frozenset[Node], Node]) -> int:
         """
         Computes the minimum number of extra lineages over all possible
@@ -690,22 +644,12 @@ class Allop_MUL(MUL):
 
         Args:
             g (Network): A gene tree
-            mrca_cache (dict): A cache for MRCA computations.
+            mrca_cache (dict): A cache for MRCA computations. Unused; the
+                               compiled core resolves MRCAs directly.
         Returns:
             int: the minimum number of extra lineages (>= 0)
         """
-        allele_maps = g.get_item("allele maps")
-        if not allele_maps:
-            return 0
-        # Cache the MUL leaf set and root once per gene tree. Both are
-        # invariant for the lifetime of the current MUL tree and were
-        # previously recomputed inside xl_helper for every visited node
-        # (the dominant runtime hotspot for larger scenarios).
-        self._mul_leaf_set = set(self.mul.get_leaves())
-        self._mul_root = self.mul.root()
-        xl = [max(0, self.XL_Allele(g, allele_map, mrca_cache))
-              for allele_map in allele_maps]
-        return min(xl)
+        return _core._allop_xl(self.mul, g)
 
     def XL_Allele(self,
                   g: Network,
@@ -717,12 +661,12 @@ class Allop_MUL(MUL):
         Args:
             g (Network): A gene tree
             f (AlleleMap): An allele map from leaves of g to leaves of T
-            mrca_cache (dict): A cache for MRCA computations.
+            mrca_cache (dict): A cache for MRCA computations. Unused; the
+                               compiled core resolves MRCAs directly.
         Returns:
             int: number of extra lineages
         """
-        edge_2_nodes = self.gene_tree_map(g, f, mrca_cache)
-        return self.extra_lineages(edge_2_nodes, f)
+        return _core._allop_xl_allele(self.mul, g, f)
 
     def score(self, gt_list: list[Network]) -> int:
         """
@@ -732,41 +676,17 @@ class Allop_MUL(MUL):
             gt_list (list[Network]): a list of gene trees
 
         Returns:
-            int: The MUL tree score 
+            int: The MUL tree score
         """
-        mrca_cache = {}    
-        gt_scores = [self.XL(gt, mrca_cache) for gt in gt_list]
-        return sum(gt_scores)
+        return _core._allop_score(self.mul, gt_list)
 
-class AlleleMap:
-    """
-    Data structure that holds a mapping from gene tree leaf names to MUL tree 
-    leaf names. Internally handles the mechanism for making sure gene copies 
-    are not mapped to the same subgenome.
-    """
-    
-    def __init__(self) -> None:
-        """Create an empty ``AlleleMap`` with no leaves mapped yet."""
-        self.map: dict[str, str] = dict()
-        self.disallowed: set[str] = set()
 
-    def put(self, g_leaf: Node, mul_leaf: str) -> int:
-        """
-        Map a gene tree leaf to a MUL tree leaf.
-
-        Args:
-            g_leaf (Node): a gene tree leaf
-            mul_leaf (str): a MUL tree leaf label
-
-        Returns:
-            int: 0 if the mapping was unsuccessful, 1 if it was.
-        """
-        if mul_leaf in self.disallowed:
-            return 0
-        
-        self.map[g_leaf.label] = mul_leaf
-        self.disallowed.add(mul_leaf)
-        return 1
+# Data structure that holds a mapping from gene tree leaf names to MUL tree
+# leaf names (``map``), and the MUL leaves already taken (``disallowed``), so
+# gene copies are never mapped to the same subgenome.  Implemented in the
+# compiled core; ``AlleleMap()`` creates an empty map and ``put(g_leaf,
+# mul_leaf)`` returns 1 on success, 0 when ``mul_leaf`` is already taken.
+AlleleMap = _core.AlleleMap
 
 ######################################
 #### LIKELIHOOD SCORER FOR MODEL  ####
@@ -777,7 +697,7 @@ class MPAllopScorer:
     Callable scorer that integrates with Model.set_likelihood_calculator().
     Computes the MP Allop parsimony score (negated for maximization).
     """
-    
+
     def __init__(self,
                  gene_map: dict[str, list[str]],
                  gene_trees: list[Network],
@@ -793,7 +713,7 @@ class MPAllopScorer:
         """
         self.mul = Allop_MUL(gene_map, rng)
         self.gene_trees = gene_trees
-    
+
     def __call__(self, model: Model) -> float:
         """
         Compute the parsimony score. Returns negated score since hill climbing
@@ -805,15 +725,15 @@ class MPAllopScorer:
         net = model.network
         if net is None:
             return float("-inf")
-        
+
         try:
             self.mul.to_mul(net)
         except Exception:
             return float("-inf")
-        
+
         if self.mul.gene_map is None:
             return float("-inf")
-        
+
         try:
             return -1 * self.mul.score(self.gene_trees)
         except Exception:
@@ -854,7 +774,7 @@ class InferMPAllop:
     """
     Class that sets up and runs the Infer_MP_Allop_2.0 inference method.
     """
-    
+
     def __init__(self,
                  network: Network,
                  gene_map: dict[str, list[str]],
@@ -874,7 +794,7 @@ class InferMPAllop:
         for gene_tree in gene_trees:
             allele_funcs = allele_map_set_ilp(gene_tree, gene_map)
             gene_tree.put_item("allele maps", allele_funcs)
-            
+
             leaf_descendants = gene_tree.leaf_descendants_all()
             gene_tree.put_item("leaf descendants", leaf_descendants)
 
@@ -892,7 +812,7 @@ class InferMPAllop:
         )
         self.iter_ct = iter_ct
         self.results: dict = {}
-        
+
     def run(self) -> float:
         """
         Computes the network with the lowest parsimony score over the set
@@ -905,9 +825,9 @@ class InferMPAllop:
                           num_iter=self.iter_ct,
                           model=self.mp_allop_model,
                           enhanced_stop=True)
-        
+
         end_state: State = hc.run()
-        
+
         self.results = hc.nets_2_scores
         return end_state.likelihood()
 

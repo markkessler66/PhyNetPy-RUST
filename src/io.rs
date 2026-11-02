@@ -15,15 +15,15 @@
 //! Everything that returns a ``Network`` builds it through
 //! ``Network::new_object`` so it is an instance of the Python class.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use indexmap::{IndexMap, IndexSet};
 use pyo3::exceptions::{
-    PyFileNotFoundError, PyIndexError, PyOSError, PyRuntimeError, PyTypeError,
-    PyUnicodeDecodeError, PyValueError,
+    PyAssertionError, PyFileNotFoundError, PyIndexError, PyKeyError, PyOSError, PyRuntimeError,
+    PyTypeError, PyUnicodeDecodeError, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -1078,26 +1078,24 @@ fn read_nexus_text(py: Python<'_>, filepath: &str) -> PyResult<String> {
     decode_with_python(py, &bytes, "utf-8-sig")
 }
 
-/// ``NexusReader.from_file(filepath).trees``: the raw ``Tree ... = ...;``
-/// lines of the TREES block, or ``None`` when the file has no such block.
-/// Raises what python-nexus raises for duplicate blocks and translate
-/// tables.
-#[pyfunction]
-fn io_nexus_tree_lines(py: Python<'_>, filepath: &str) -> PyResult<Option<Vec<String>>> {
-    let text = read_nexus_text(py, filepath)?;
-    // ``NexusReader._iter_blocks``
+/// ``NexusReader._iter_blocks``: ``(lower-case block name, stripped lines)``
+/// in file order.  Blank lines and whole-line ``[...]`` comments are
+/// dropped; ``end`` is optional.
+fn nexus_blocks(text: &str) -> Vec<(String, Vec<String>)> {
     let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
     let mut block: Option<String> = None;
     let mut lines: Vec<String> = Vec::new();
-    for raw in py_lines(&text) {
+    for raw in py_lines(text) {
         let line = py_strip(raw);
         if line.is_empty() || (line.starts_with('[') && line.ends_with(']')) {
             continue;
         }
         if let Some(name) = begin_block_name(line) {
-            if block.is_some() && !lines.is_empty() {
-                // "end" is optional.
-                blocks.push((block.take().unwrap(), std::mem::take(&mut lines)));
+            if let Some(open) = block.take() {
+                if !lines.is_empty() {
+                    // "end" is optional.
+                    blocks.push((open, std::mem::take(&mut lines)));
+                }
             }
             block = Some(name.to_lowercase());
             lines = Vec::new();
@@ -1118,18 +1116,1158 @@ fn io_nexus_tree_lines(py: Python<'_>, filepath: &str) -> PyResult<Option<Vec<St
             blocks.push((b, lines));
         }
     }
-    // ``NexusReader._set_blocks``
+    blocks
+}
+
+/// ``re.match(r"end\s*;", s)`` (case insensitive, anchored at the start).
+fn end_pattern_at_start(s: &str) -> bool {
+    let chars: Vec<char> = s.chars().collect();
+    let lower = lowercase_chars(&chars);
+    if lower.len() < 4 || lower[..3] != ['e', 'n', 'd'] {
+        return false;
+    }
+    let mut k = 3;
+    while k < chars.len() && py_is_space(chars[k]) {
+        k += 1;
+    }
+    k < chars.len() && chars[k] == ';'
+}
+
+/// ``QUOTED_PATTERN.sub('\\1', s)``: ``^["'](.*)["']$``.
+fn nexus_dequote(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    if n >= 2 && matches!(chars[0], '"' | '\'') && matches!(chars[n - 1], '"' | '\'') && !chars[1..n - 1].contains(&'\n') {
+        chars[1..n - 1].iter().collect()
+    } else {
+        s.to_string()
+    }
+}
+
+/// ``GenericHandler.remove_comments``: ``re.sub(r"(\[.*?])", "", line)``.
+fn nexus_remove_comments(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = String::with_capacity(line.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '[' {
+            if let Some(off) = chars[i + 1..].iter().position(|c| *c == ']') {
+                i += off + 2;
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+/// ``re.split(r"\s+", line, 1)`` unpacked into two parts, or ``None`` when
+/// the line holds no whitespace (python-nexus skips such lines).
+fn split_first_ws(line: &str) -> Option<(&str, &str)> {
+    let start = line.find(|c: char| py_is_space(c))?;
+    let rest = &line[start..];
+    let end = rest.find(|c: char| !py_is_space(c)).unwrap_or(rest.len());
+    Some((&line[..start], &rest[end..]))
+}
+
+/// ``DataHandler._parse_sites``: one token per site, ``(..)`` multistate
+/// groups kept as one token.
+fn nexus_parse_sites(sites: &str) -> PyResult<Vec<String>> {
+    let parsed: Vec<char> = sites.chars().filter(|c| *c != ' ' && *c != ';').collect();
+    if !parsed.contains(&'(') {
+        return Ok(parsed.iter().map(|c| c.to_string()).collect());
+    }
+    let mut out = Vec::new();
+    let mut todo = parsed.into_iter();
+    while let Some(site) = todo.next() {
+        if site == ',' {
+            continue;
+        }
+        if site == '(' {
+            let mut multi = String::new();
+            loop {
+                match todo.next() {
+                    Some(')') => break,
+                    Some(c) => multi.push(c),
+                    None => return Err(PyIndexError::new_err("pop from empty list")),
+                }
+            }
+            out.push(multi);
+        } else {
+            out.push(site.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// ``int(text)`` as an ``i64`` with Python's error message.
+fn py_int_i64(py: Python<'_>, text: &str) -> PyResult<i64> {
+    py_int_builtin(py, text)?.extract::<i64>()
+}
+
+/// ``DataHandler.parse_range`` for its ``int`` conversions (the labels
+/// themselves are not needed, only the errors python-nexus raised).
+fn nexus_parse_range(py: Python<'_>, siterange: &str) -> PyResult<()> {
+    if siterange.contains(',') {
+        for c in siterange.split(',') {
+            py_int_i64(py, c)?;
+        }
+    } else if siterange.contains('-') {
+        let parts: Vec<&str> = siterange.split('-').collect();
+        if parts.len() != 2 {
+            return Err(PyValueError::new_err(format!(
+                "too many values to unpack (expected 2{})",
+                if parts.len() < 2 { format!(", got {}", parts.len()) } else { String::new() }
+            )));
+        }
+        py_int_i64(py, parts[0])?;
+        py_int_i64(py, parts[1])?;
+    } else {
+        py_int_i64(py, siterange)?;
+    }
+    Ok(())
+}
+
+/// ``re.findall(r"(.+?)=(.+?);", line)``: the second group of every match.
+fn nexus_label_values(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while pos + 1 < chars.len() {
+        let Some(eq) = (pos + 1..chars.len()).find(|&i| chars[i] == '=') else { break };
+        let Some(semi) = (eq + 2..chars.len()).find(|&i| chars[i] == ';') else { break };
+        out.push(chars[eq + 1..semi].iter().collect());
+        pos = semi + 1;
+    }
+    out
+}
+
+/// ``re.findall(r"<key>(\d+)", line, re.I)[0]``: the digits right after
+/// ``key`` (case insensitive), or ``None``.
+fn nexus_int_after(py: Python<'_>, line: &str, key: &str) -> PyResult<Option<i64>> {
+    let lower = line.to_lowercase();
+    let mut search = 0;
+    while let Some(off) = lower[search..].find(key) {
+        let start = search + off + key.len();
+        let digits: String = line[start..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return Ok(Some(py_int_i64(py, &digits)?));
+        }
+        search = start;
+    }
+    Ok(None)
+}
+
+/// ``DataHandler._parse_charstate_block``: strip ``charstatelabels ...;``
+/// out of the block text; returns the text and the number of labels.
+fn nexus_strip_charstatelabels(py: Python<'_>, text: &str) -> PyResult<(String, usize)> {
+    let lower = text.to_lowercase();
+    let key = "charstatelabels";
+    let mut spans: Vec<(usize, usize, String)> = Vec::new();
+    let mut search = 0;
+    while let Some(off) = lower[search..].find(key) {
+        let start = search + off;
+        let body_start = start + key.len();
+        match text[body_start..].find(';') {
+            Some(semi) => {
+                let end = body_start + semi + 1;
+                spans.push((start, end, text[body_start..body_start + semi].to_string()));
+                search = end;
+            }
+            None => break,
+        }
+    }
+    let mut count = 0usize;
+    if spans.len() == 1 {
+        for label in spans[0].2.split(',') {
+            if py_strip(label).is_empty() {
+                warn(py, &format!("Encountered an empty character label at position {count}"))?;
+                continue;
+            }
+            count += 1;
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for (s, e, _) in &spans {
+        out.push_str(&text[last..*s]);
+        last = *e;
+    }
+    out.push_str(&text[last..]);
+    Ok((out, count))
+}
+
+/// ``nexus.handlers.data.iter_block``: ``(line, lower-stripped line,
+/// in_matrix)`` for the lines that are not the BEGIN/END/FORMAT/MATRIX
+/// commands.
+fn nexus_iter_block<'a>(lines: &[&'a str]) -> Vec<(&'a str, String, bool)> {
+    let mut seen_matrix = false;
+    let mut out = Vec::new();
+    for line in lines {
+        let lline = line.to_lowercase();
+        let lline = py_strip(&lline).to_string();
+        if end_pattern_at_start(&lline) || lline.starts_with("format") {
+            continue;
+        }
+        if begin_block_name(line).is_some() && line.to_lowercase().starts_with("begin ") {
+            continue;
+        }
+        if lline.starts_with("matrix") {
+            seen_matrix = true;
+            continue;
+        }
+        out.push((*line, lline, seen_matrix));
+    }
+    out
+}
+
+/// python-nexus' ``DataHandler``: the ``(taxon, site tokens)`` rows of a
+/// DATA or CHARACTERS block, with the warnings and errors it raised.
+fn nexus_data_matrix(py: Python<'_>, block: &[String]) -> PyResult<Vec<(String, Vec<String>)>> {
+    let joined = block.join("\n");
+    let (joined, charlabel_count) = nexus_strip_charstatelabels(py, &joined)?;
+    let lines: Vec<&str> = joined.split('\n').collect();
+    let entries = nexus_iter_block(&lines);
+    let mut dim_taxa: Option<i64> = None;
+    let mut dim_chars: Option<i64> = None;
+    let mut matrix: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut read_data = false;
+    for (line, lline, in_matrix) in &entries {
+        if lline.starts_with("dimensions ") {
+            if let Some(n) = nexus_int_after(py, line, "ntax=")? {
+                dim_taxa = Some(n);
+            }
+            if let Some(n) = nexus_int_after(py, line, "nchar=")? {
+                dim_chars = Some(n);
+            }
+        } else if is_mesquite_attribute(line) {
+            // A Mesquite TITLE/LINK attribute.
+        } else if *in_matrix {
+            let line = nexus_remove_comments(line);
+            let Some((taxon, sites)) = split_first_ws(&line) else { continue };
+            read_data = true;
+            let taxon = nexus_dequote(py_strip(taxon));
+            let sites = nexus_parse_sites(py_strip(sites))?;
+            matrix.entry(taxon).or_default().extend(sites);
+        } else {
+            for value in nexus_label_values(line) {
+                nexus_parse_range(py, &value)?;
+            }
+        }
+    }
+    if !read_data {
+        // A "wrapped" matrix: taxon on one line, its sites on the next.
+        let mut taxon: Option<String> = None;
+        let mut sites: Vec<String> = Vec::new();
+        for (line, lline, in_matrix) in &entries {
+            if !*in_matrix || lline.is_empty() {
+                continue;
+            }
+            match &taxon {
+                None => {
+                    let t = py_strip(line);
+                    if t.chars().any(py_is_space) {
+                        return Err(PyAssertionError::new_err(()));
+                    }
+                    taxon = Some(nexus_dequote(t));
+                }
+                Some(t) => {
+                    sites.extend(nexus_parse_sites(py_strip(line))?);
+                    if dim_chars == Some(sites.len() as i64) {
+                        matrix.entry(t.clone()).or_default().extend(std::mem::take(&mut sites));
+                        taxon = None;
+                    }
+                }
+            }
+        }
+    }
+    let ntaxa = matrix.len() as i64;
+    if let Some(dt) = dim_taxa {
+        if ntaxa != dt {
+            warn(py, &format!("Expected {ntaxa} taxa, got {dt}"))?;
+        }
+    }
+    let nchar = match matrix.values().next() {
+        Some(first) => first.len() as i64,
+        None if charlabel_count > 0 => charlabel_count as i64,
+        None => 0,
+    };
+    if let Some(dc) = dim_chars {
+        if nchar != dc {
+            warn(py, &format!("Expected {nchar} characters, got {dc}"))?;
+        }
+    }
+    Ok(matrix.into_iter().collect())
+}
+
+/// ``re.sub(r"\btaxlabels\b", "", line)`` (case insensitive).
+fn remove_taxlabels_words(line: &str) -> String {
+    let chars: Vec<char> = line.chars().collect();
+    let lower = lowercase_chars(&chars);
+    let key: Vec<char> = "taxlabels".chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let at_word = i + key.len() <= chars.len()
+            && lower[i..i + key.len()] == key[..]
+            && (i == 0 || !is_word(chars[i - 1]))
+            && (i + key.len() == chars.len() || !is_word(chars[i + key.len()]));
+        if at_word {
+            i += key.len();
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// python-nexus' ``TaxaHandler``: only its consistency check matters here
+/// (it raises when the taxa count and the DIMENSIONS line disagree).
+fn nexus_taxa_check(py: Python<'_>, block: &[String]) -> PyResult<()> {
+    let mut taxa: Vec<String> = Vec::new();
+    let mut found: Option<i64> = None;
+    let mut in_taxlabels = false;
+    for raw in block {
+        let line = nexus_dequote(raw);
+        let lower = line.to_lowercase();
+        // ``^dimensions\s*ntax\s*=\s*(\d+)``
+        if let Some(rest) = lower.strip_prefix("dimensions") {
+            let rest = rest.trim_start();
+            if let Some(rest) = rest.strip_prefix("ntax") {
+                let rest = rest.trim_start();
+                if let Some(rest) = rest.strip_prefix('=') {
+                    let digits: String = rest.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !digits.is_empty() {
+                        found = Some(py_int_i64(py, &digits)?);
+                        continue;
+                    }
+                }
+            }
+        }
+        if lower.contains("begin taxa") || line == ";" || end_pattern_at_start(py_strip(&line)) || is_mesquite_attribute(&line) {
+            continue;
+        }
+        let mut line = line;
+        let starts_taxlabels = lower.starts_with("taxlabels")
+            && lower.chars().nth("taxlabels".len()).map_or(true, |c| !is_word(c));
+        if in_taxlabels || starts_taxlabels {
+            in_taxlabels = true;
+            line = remove_taxlabels_words(&line);
+        }
+        for piece in line.split(' ') {
+            let token: String = piece.chars().filter(|c| *c != ';').collect();
+            let mut token = py_strip(&token).to_string();
+            // ``^\[.*\]\s+``: a leading comment.
+            if token.starts_with('[') {
+                if let Some(close) = token.rfind(']') {
+                    let after = &token[close + 1..];
+                    if !after.is_empty() && after.chars().all(py_is_space) {
+                        token = String::new();
+                    }
+                }
+            }
+            // ``(.*)(\[.*\])$``: a trailing annotation.
+            if token.ends_with(']') {
+                if let Some(open) = token.rfind('[') {
+                    token = token[..open].to_string();
+                }
+            }
+            let token = nexus_dequote(&token);
+            if !token.is_empty() && !taxa.contains(&token) {
+                taxa.push(token);
+            }
+        }
+    }
+    if let Some(f) = found {
+        if f != 0 && f != taxa.len() as i64 {
+            return Err(nexus_format_error(
+                py,
+                format!("Number of found taxa ({}) doesn't match dimensions declaration ({f})", taxa.len()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What ``NexusReader.from_file`` exposes of a file: the TREES block's tree
+/// lines and the DATA (else CHARACTERS) block's matrix rows.
+struct NexusFile {
+    trees: Option<Vec<String>>,
+    data: Option<Vec<(String, Vec<String>)>>,
+}
+
+/// ``NexusReader._set_blocks``: every block's handler is built in file
+/// order (raising what python-nexus raised), duplicates are an error.
+fn nexus_read(py: Python<'_>, text: &str) -> PyResult<NexusFile> {
     let mut seen: FxHashSet<String> = FxHashSet::default();
-    let mut trees: Option<Vec<String>> = None;
-    for (name, block_lines) in blocks {
+    let mut trees = None;
+    let mut data = None;
+    let mut characters = None;
+    for (name, lines) in nexus_blocks(text) {
         if !seen.insert(name.clone()) {
             return Err(nexus_format_error(py, format!("Duplicate Block {name}")));
         }
-        if name == "trees" {
-            trees = Some(trees_block_lines(py, &block_lines)?);
+        match name.as_str() {
+            "trees" => trees = Some(trees_block_lines(py, &lines)?),
+            "data" => data = Some(nexus_data_matrix(py, &lines)?),
+            "characters" => characters = Some(nexus_data_matrix(py, &lines)?),
+            "taxa" => nexus_taxa_check(py, &lines)?,
+            _ => {}
         }
     }
-    Ok(trees)
+    if data.is_none() {
+        data = characters;
+    }
+    Ok(NexusFile { trees, data })
+}
+
+/// ``NexusReader.from_file(filepath).trees``: the raw ``Tree ... = ...;``
+/// lines of the TREES block, or ``None`` when the file has no such block.
+/// Raises what python-nexus raises for duplicate blocks, translate tables
+/// and malformed DATA / TAXA blocks.
+#[pyfunction]
+fn io_nexus_tree_lines(py: Python<'_>, filepath: &str) -> PyResult<Option<Vec<String>>> {
+    let text = read_nexus_text(py, filepath)?;
+    Ok(nexus_read(py, &text)?.trees)
+}
+
+// ───────────────────── NEXUS alignment matrix (MSA.parse) ─────────────────────
+//
+// ``MSA.parse`` read the DATA/CHARACTERS matrix with ``Bio.AlignIO.read(path,
+// "nexus")`` and, when BioPython raised ``NexusError``, with python-nexus'
+// ``NexusReader.from_file(path).data``.  Both are reproduced: the BioPython
+// emulation covers its comment stripping, command splitting, DIMENSIONS /
+// FORMAT / MATRIX handling (matchchar, interleaving, wrapped lines,
+// parenthesised ambiguity codes, duplicate labels, character validation)
+// and the conditions under which it raised ``NexusError`` (including the
+// attribute errors its command dispatcher turned into one); those select
+// the python-nexus emulation above.
+//
+// Deliberate differences: TREES blocks are not parsed by the BioPython
+// emulation (BioPython raised ``TreeError`` for a Newick string it could
+// not read); ``datatype=standard`` yields its codings as tokens (BioPython
+// crashed with a ``RuntimeError`` while building the alignment); a missing
+// file is ``FileNotFoundError`` (BioPython parsed the path as NEXUS text).
+
+const BIO_WHITESPACE: &str = " \t\n";
+const BIO_PUNCTUATION: &str = "()[]{}\\,;:=*'\"`+-<>";
+const BIO_SPECIAL_COMMANDS: &[&str] = &[
+    "charstatelabels", "charlabels", "taxlabels", "taxset", "charset", "charpartition",
+    "taxpartition", "matrix", "tree", "utree", "translate", "codonposset", "title",
+];
+const BIO_KNOWN_BLOCKS: &[&str] = &["trees", "data", "characters", "taxa", "sets", "codons"];
+/// Commands ``Bio.Nexus.Nexus`` has a ``_<command>`` method for.
+const BIO_COMMANDS: &[&str] = &[
+    "adjust_charlabels", "apply_block_structure", "changeset", "charlabels", "charpartition",
+    "charset", "charstatelabels", "check_taxlabels", "codeset", "codonposset", "dimensions",
+    "eliminate", "format", "get_indices", "get_nexus_block", "link", "matrix", "name_n_vector",
+    "options", "parse_list", "parse_nexus_block", "resolve", "set", "statelabels", "stateset",
+    "taxlabels", "taxpartition", "taxset", "title", "translate", "tree", "treepartition",
+    "treeset", "unknown_nexus_block", "utree",
+];
+const IUPAC_DNA: &[(char, &str)] = &[
+    ('A', "A"), ('C', "C"), ('G', "G"), ('T', "T"), ('M', "AC"), ('R', "AG"), ('W', "AT"),
+    ('S', "CG"), ('Y', "CT"), ('K', "GT"), ('V', "ACG"), ('H', "ACT"), ('D', "AGT"),
+    ('B', "CGT"), ('X', "GATC"), ('N', "GATC"),
+];
+const IUPAC_RNA: &[(char, &str)] = &[
+    ('A', "A"), ('C', "C"), ('G', "G"), ('U', "U"), ('M', "AC"), ('R', "AG"), ('W', "AU"),
+    ('S', "CG"), ('Y', "CU"), ('K', "GU"), ('V', "ACG"), ('H', "ACU"), ('D', "AGU"),
+    ('B', "CGU"), ('X', "GAUC"), ('N', "GAUC"),
+];
+const PROTEIN_LETTERS: &str = "ACDEFGHIKLMNPQRSTVWY";
+
+/// How the BioPython emulation fails: a ``NexusError`` (the caller falls
+/// back to python-nexus) or another Python exception (propagated).
+enum BioErr {
+    /// The message BioPython would have raised (kept as a debugging aid).
+    #[allow(dead_code)]
+    Nexus(String),
+    Py(PyErr),
+}
+
+impl From<PyErr> for BioErr {
+    fn from(e: PyErr) -> Self {
+        BioErr::Py(e)
+    }
+}
+
+fn bio_nexus_err(msg: impl Into<String>) -> BioErr {
+    BioErr::Nexus(msg.into())
+}
+
+fn bio_stop_iteration() -> BioErr {
+    BioErr::Py(PyRuntimeError::new_err("generator raised StopIteration"))
+}
+
+/// ``_kill_comments_and_break_lines`` + ``_adjust_lines``: the command
+/// lines of the file, comments removed (``[&...]`` kept), split on ``;``
+/// outside quotes, newlines kept only inside MATRIX commands.
+fn bio_commandlines(text: &str) -> Result<Vec<String>, BioErr> {
+    let mut s = text.trim();
+    if let Some(rest) = s.strip_prefix("#NEXUS") {
+        s = rest;
+    }
+    let chars: Vec<char> = s.chars().collect();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut special = false;
+    let mut comm: i32 = 0;
+    for i in 0..chars.len() {
+        let t = chars[i];
+        let t2 = chars.get(i + 1).copied();
+        if Some(t) == quote && comm == 0 && !special {
+            quote = None;
+        } else if quote.is_none() && comm == 0 && !special && (t == '"' || t == '\'') {
+            quote = Some(t);
+        } else if quote.is_none() && t == '[' {
+            if t2 == Some('&') && comm == 0 && !special {
+                special = true;
+            } else {
+                comm += 1;
+            }
+        } else if quote.is_none() && t == ']' {
+            if special {
+                special = false;
+            } else {
+                comm -= 1;
+                if comm < 0 {
+                    return Err(bio_nexus_err("Nexus formatting error: unmatched ]"));
+                }
+                continue;
+            }
+        }
+        if comm == 0 {
+            if t == ';' && quote.is_none() {
+                pieces.push(std::mem::take(&mut cur));
+            } else {
+                cur.push(t);
+            }
+        }
+    }
+    if !cur.is_empty() {
+        pieces.push(cur);
+    }
+    if comm > 0 {
+        return Err(bio_nexus_err("Nexus formatting error: unmatched ["));
+    }
+    let mut formatted: Vec<String> = Vec::new();
+    for piece in pieces {
+        let piece = piece.replace("\r\n", "\n").replace('\r', "\n");
+        let line = piece.trim();
+        if line.to_lowercase().starts_with("matrix") {
+            formatted.push(line.to_string());
+        } else {
+            let flat = line.replace('\n', " ");
+            if !flat.is_empty() {
+                formatted.push(flat);
+            }
+        }
+    }
+    for cl in formatted.iter_mut() {
+        if cl.get(..6).is_some_and(|h| h.eq_ignore_ascii_case("#NEXUS")) {
+            *cl = cl[6..].trim().to_string();
+        }
+    }
+    Ok(formatted)
+}
+
+/// ``Nexus._get_nexus_block``: ``(title, command lines)`` per block.
+fn bio_blocks(commandlines: Vec<String>) -> Result<Vec<(String, Vec<String>)>, BioErr> {
+    let mut blocks = Vec::new();
+    let mut inblock = false;
+    let mut title = String::new();
+    let mut lines: Vec<String> = Vec::new();
+    for cl in commandlines {
+        let lower = cl.to_lowercase();
+        if lower.starts_with("begin") {
+            if inblock {
+                return Err(bio_nexus_err(format!("Illegal block nesting in block {title}")));
+            }
+            inblock = true;
+            title = cl
+                .split_whitespace()
+                .nth(1)
+                .ok_or_else(|| BioErr::Py(PyIndexError::new_err("list index out of range")))?
+                .to_lowercase();
+        } else if lower.starts_with("end") {
+            if !inblock {
+                return Err(bio_nexus_err("Unmatched 'end'."));
+            }
+            inblock = false;
+            blocks.push((std::mem::take(&mut title), std::mem::take(&mut lines)));
+        } else if inblock {
+            lines.push(cl);
+        }
+    }
+    Ok(blocks)
+}
+
+/// ``Bio.Nexus.Nexus.Commandline``.
+struct BioCommand {
+    command: String,
+    /// The raw option text of a SPECIAL_COMMANDS command (``matrix``).
+    raw: String,
+    /// ``key = value`` options of every other command (bare tokens map to ``None``).
+    options: IndexMap<String, Option<String>>,
+}
+
+fn bio_commandline(line: &str) -> Result<BioCommand, BioErr> {
+    let line = line.trim();
+    let (command, options) = match line.split_once('\n') {
+        Some((c, o)) => (c.trim().to_lowercase(), o.to_string()),
+        None => {
+            let mut words = line.split_whitespace();
+            let c = words.next().unwrap_or("").to_lowercase();
+            (c, words.collect::<Vec<_>>().join(" "))
+        }
+    };
+    if BIO_SPECIAL_COMMANDS.contains(&command.as_str()) {
+        return Ok(BioCommand { command, raw: options.trim().to_string(), options: IndexMap::new() });
+    }
+    let mut map: IndexMap<String, Option<String>> = IndexMap::new();
+    if !options.is_empty() {
+        let toks: Vec<String> = options.replace('=', " = ").split_whitespace().map(String::from).collect();
+        let mut used = vec![false; toks.len()];
+        for n in 0..toks.len() {
+            if toks[n] == "=" && n != 0 {
+                let value = toks
+                    .get(n + 1)
+                    .ok_or_else(|| BioErr::Py(PyIndexError::new_err("list index out of range")))?
+                    .clone();
+                used[n - 1] = true;
+                used[n] = true;
+                used[n + 1] = true;
+                map.insert(toks[n - 1].to_lowercase(), Some(value));
+            }
+        }
+        for n in 0..toks.len() {
+            if !used[n] {
+                map.insert(toks[n].to_lowercase(), None);
+            }
+        }
+    }
+    Ok(BioCommand { command, raw: String::new(), options: map })
+}
+
+/// ``options[key][0]``: the first character of an option value.
+fn bio_first_char(value: &Option<String>) -> Result<char, BioErr> {
+    match value {
+        None => Err(BioErr::Py(PyTypeError::new_err("'NoneType' object is not subscriptable"))),
+        Some(v) => v.chars().next().ok_or_else(|| BioErr::Py(PyIndexError::new_err("string index out of range"))),
+    }
+}
+
+/// ``CharBuffer.next_word`` from ``pos``: the word and the position after it.
+fn bio_next_word(chars: &[char], pos: usize) -> (Option<String>, usize) {
+    let n = chars.len();
+    let mut i = pos;
+    while i < n && BIO_WHITESPACE.contains(chars[i]) {
+        i += 1;
+    }
+    if i >= n {
+        return (None, n);
+    }
+    let first = chars[i];
+    i += 1;
+    let mut word = vec![first];
+    let quoted = matches!(first, '\'' | '"').then_some(first);
+    if quoted.is_none() && BIO_PUNCTUATION.contains(first) {
+        return (Some(first.to_string()), i);
+    }
+    loop {
+        let c = chars.get(i).copied();
+        if quoted.is_some() && c == quoted {
+            word.push(chars[i]);
+            i += 1;
+            if chars.get(i).copied() == quoted {
+                i += 1;
+            } else {
+                break;
+            }
+        } else if quoted.is_some() {
+            match c {
+                Some(ch) => {
+                    word.push(ch);
+                    i += 1;
+                }
+                None => break,
+            }
+        } else {
+            match c {
+                Some(ch) if !BIO_PUNCTUATION.contains(ch) && !BIO_WHITESPACE.contains(ch) => {
+                    word.push(ch);
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+    }
+    (Some(word.into_iter().collect()), i)
+}
+
+/// ``quotestrip``.
+fn bio_quotestrip(word: &str) -> String {
+    let mut w: Vec<char> = word.chars().collect();
+    while w.len() >= 2
+        && ((w[0] == '\'' && w[w.len() - 1] == '\'') || (w[0] == '"' && w[w.len() - 1] == '"'))
+    {
+        w = w[1..w.len() - 1].to_vec();
+    }
+    if w.len() == 1 && matches!(w[0], '\'' | '"') {
+        // ``"'"[1:-1]`` is the empty string.
+        w.clear();
+    }
+    w.into_iter().collect()
+}
+
+/// ``_unique_label``.
+fn bio_unique_label<'a>(previous: impl Iterator<Item = &'a String>, label: &str) -> Result<String, BioErr> {
+    let previous: FxHashSet<&str> = previous.map(|s| s.as_str()).collect();
+    let mut label = label.to_string();
+    while previous.contains(label.as_str()) {
+        let parts: Vec<&str> = label.split('.').collect();
+        let last = parts[parts.len() - 1];
+        if let Some(num_text) = last.strip_prefix("copy") {
+            let copy_num = if num_text.is_empty() {
+                1
+            } else {
+                num_text.parse::<i64>().map_err(|_| {
+                    BioErr::Py(PyValueError::new_err(format!(
+                        "invalid literal for int() with base 10: {}",
+                        py_repr(num_text)
+                    )))
+                })? + 1
+            };
+            label = format!("{}.copy{copy_num}", parts[..parts.len() - 1].join("."));
+        } else {
+            label.push_str(".copy");
+        }
+    }
+    Ok(label)
+}
+
+/// ``_replace_parenthesized_ambigs``.
+fn bio_replace_parenthesized(seq: &str, rev: &HashMap<String, char>) -> Result<Vec<char>, BioErr> {
+    let mut seq: Vec<char> = seq.chars().collect();
+    while let Some(opening) = seq.iter().position(|c| *c == '(') {
+        let closing = seq
+            .iter()
+            .position(|c| *c == ')')
+            .ok_or_else(|| bio_nexus_err(format!("Missing closing parenthesis in: {}", seq.iter().collect::<String>())))?;
+        if closing < opening {
+            return Err(bio_nexus_err(format!("Missing opening parenthesis in: {}", seq.iter().collect::<String>())));
+        }
+        let mut inner: Vec<char> = seq[opening + 1..closing].to_vec();
+        inner.sort_unstable();
+        let ambig: String = inner.iter().collect();
+        let upper = ambig.to_uppercase();
+        let mut code = *rev
+            .get(&upper)
+            .ok_or_else(|| BioErr::Py(PyKeyError::new_err(upper.clone())))?;
+        if ambig != upper {
+            code = code.to_lowercase().next().unwrap_or(code);
+        }
+        seq.splice(opening..=closing, std::iter::once(code));
+    }
+    Ok(seq)
+}
+
+/// ``StandardData``: ``(kind, symbols)`` per coding; kind is ``'s'``
+/// (single), ``'m'`` (``(..)`` multistate) or ``'u'`` (``{..}`` uncertain).
+fn bio_standard_data(chars: &str) -> Result<Vec<(char, Vec<char>)>, BioErr> {
+    let mut data: Vec<(char, Vec<char>)> = Vec::new();
+    let mut multi = false;
+    let mut uncertain = false;
+    let mut current: (char, Vec<char>) = ('s', Vec::new());
+    for (pos, coding) in chars.chars().enumerate() {
+        if multi {
+            if coding == ')' {
+                multi = false;
+            } else {
+                current.1.push(coding);
+                continue;
+            }
+        } else if uncertain {
+            if coding == '}' {
+                uncertain = false;
+            } else {
+                current.1.push(coding);
+                continue;
+            }
+        } else if coding == '(' {
+            multi = true;
+            current.0 = 'm';
+            continue;
+        } else if coding == '{' {
+            uncertain = true;
+            current.0 = 'u';
+            continue;
+        } else if coding == ')' || coding == '}' {
+            return Err(bio_nexus_err(format!("Improper character {coding} at position {pos} of a coding sequence.")));
+        } else {
+            current.1.push(coding);
+        }
+        data.push(std::mem::replace(&mut current, ('s', Vec::new())));
+    }
+    Ok(data)
+}
+
+fn bio_standard_token(coding: &(char, Vec<char>)) -> String {
+    let body: String = coding.1.iter().collect();
+    match coding.0 {
+        'm' => format!("({body})"),
+        'u' => format!("{{{body}}}"),
+        _ => body,
+    }
+}
+
+/// The datatype-dependent tables ``Nexus._format`` creates.
+struct BioType {
+    ambiguous: IndexMap<char, String>,
+    unambiguous: String,
+    valid: String,
+    rev: HashMap<String, char>,
+}
+
+/// The ``Bio.Nexus.Nexus`` state the DATA/CHARACTERS commands update.
+struct BioNexus {
+    ntax: i64,
+    nchar: i64,
+    datatype: String,
+    respectcase: bool,
+    missing: char,
+    gap: char,
+    symbols: Option<Vec<char>>,
+    matchchar: Option<char>,
+    interleave: bool,
+    typed: Option<BioType>,
+    have_matrix: bool,
+    matrix: IndexMap<String, Vec<String>>,
+    unaltered: Vec<String>,
+    taxlabels: Vec<String>,
+}
+
+impl BioNexus {
+    fn new() -> Self {
+        BioNexus {
+            ntax: 0,
+            nchar: 0,
+            datatype: "dna".to_string(),
+            respectcase: false,
+            missing: '?',
+            gap: '-',
+            symbols: None,
+            matchchar: None,
+            interleave: false,
+            typed: None,
+            have_matrix: false,
+            matrix: IndexMap::new(),
+            unaltered: Vec::new(),
+            taxlabels: Vec::new(),
+        }
+    }
+
+    fn dimensions(&mut self, py: Python<'_>, opts: &IndexMap<String, Option<String>>) -> Result<(), BioErr> {
+        for (key, slot) in [("ntax", &mut self.ntax), ("nchar", &mut self.nchar)] {
+            if let Some(value) = opts.get(key) {
+                let value = value
+                    .as_ref()
+                    .ok_or_else(|| BioErr::Py(PyTypeError::new_err("int() can't convert non-string with explicit base")))?;
+                *slot = py_int_i64(py, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn format(&mut self, opts: &IndexMap<String, Option<String>>) -> Result<(), BioErr> {
+        // An AttributeError inside a command handler is reported by
+        // BioPython as ``NexusError("Unknown command: format ")``.
+        let attr_err = || bio_nexus_err("Unknown command: format ");
+        if opts.contains_key("respectcase") {
+            self.respectcase = true;
+        }
+        if let Some(value) = opts.get("symbols") {
+            let value = value.as_ref().ok_or_else(attr_err)?;
+            let mut s: Vec<char> = value.split_whitespace().collect::<String>().chars().collect();
+            let n = s.len();
+            if n >= 1 && ((s[0] == '"' && s[n - 1] == '"') || (s[0] == '\'' && s[n - 1] == '\'')) {
+                s = if n >= 2 { s[1..n - 1].to_vec() } else { Vec::new() };
+            }
+            if !self.respectcase {
+                s = s.iter().flat_map(|c| c.to_uppercase()).collect();
+            }
+            self.symbols = Some(s);
+        }
+        if let Some(value) = opts.get("datatype") {
+            let value = value.as_ref().ok_or_else(attr_err)?;
+            let dt = value.to_lowercase();
+            let (ambiguous, unambiguous): (Vec<(char, String)>, String) = match dt.as_str() {
+                "dna" | "nucleotide" => (IUPAC_DNA.iter().map(|(k, v)| (*k, v.to_string())).collect(), "GATC".to_string()),
+                "rna" => (IUPAC_RNA.iter().map(|(k, v)| (*k, v.to_string())).collect(), "GAUC".to_string()),
+                "protein" => (
+                    vec![('B', "DN".to_string()), ('Z', "EQ".to_string()), ('X', PROTEIN_LETTERS.to_string())],
+                    format!("{PROTEIN_LETTERS}*"),
+                ),
+                "standard" => {
+                    let syms = self.symbols.as_ref().filter(|s| !s.is_empty()).ok_or_else(|| {
+                        bio_nexus_err(
+                            "Symbols must be defined when using standard datatype. Please remove any whitespace \
+                             (spaces, tabs, etc.) between values for symbols as this confuses the Nexus parser.",
+                        )
+                    })?;
+                    let mut u: String = syms.iter().collect();
+                    if !self.respectcase {
+                        u = format!("{u}{}", u.to_lowercase());
+                    }
+                    (Vec::new(), u)
+                }
+                _ => return Err(bio_nexus_err(format!("Unsupported datatype: {dt}"))),
+            };
+            self.datatype = dt;
+            let mut valid: String = ambiguous.iter().map(|(k, _)| *k).collect();
+            valid.push_str(&unambiguous);
+            if !self.respectcase {
+                valid = format!("{}{}", valid.to_lowercase(), valid.to_uppercase());
+            }
+            let mut rev: HashMap<String, char> = HashMap::new();
+            for (k, v) in &ambiguous {
+                if *k != 'X' {
+                    let mut cs: Vec<char> = v.chars().collect();
+                    cs.sort_unstable();
+                    rev.insert(cs.into_iter().collect(), *k);
+                }
+            }
+            self.typed = Some(BioType { ambiguous: ambiguous.into_iter().collect(), unambiguous, valid, rev });
+        }
+        if matches!(self.datatype.as_str(), "dna" | "nucleotide" | "rna") {
+            let letters = if self.datatype == "rna" { "GAUCRYWSMKHBVDN" } else { "GATCRYWSMKHBVDN" };
+            let t = self.typed.as_mut().ok_or_else(attr_err)?;
+            self.symbols = Some(letters.chars().collect());
+            if !t.ambiguous.contains_key(&self.missing) {
+                let v = format!("{}{}", t.unambiguous, self.gap);
+                t.ambiguous.insert(self.missing, v);
+            }
+            t.ambiguous.insert(self.gap, self.gap.to_string());
+        }
+        if let Some(value) = opts.get("missing") {
+            self.missing = bio_first_char(value)?;
+        }
+        if let Some(value) = opts.get("gap") {
+            self.gap = bio_first_char(value)?;
+        }
+        if let Some(value) = opts.get("matchchar") {
+            self.matchchar = Some(bio_first_char(value)?);
+        }
+        if let Some(value) = opts.get("interleave") {
+            if value.as_ref().is_none_or(|v| v.to_lowercase() == "yes") {
+                self.interleave = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn check_taxlabels(&self, taxon: &str) -> Option<String> {
+        let key = taxon.replace(' ', "_");
+        let mut found = None;
+        for t in &self.taxlabels {
+            if t.replace(' ', "_") == key {
+                found = Some(t.clone());
+            }
+        }
+        found
+    }
+
+    fn matrix(&mut self, raw: &str) -> Result<(), BioErr> {
+        if self.ntax == 0 || self.nchar == 0 {
+            return Err(bio_nexus_err("Dimensions must be specified before matrix!"));
+        }
+        self.matrix.clear();
+        self.have_matrix = true;
+        let lines: Vec<&str> = raw.split('\n').map(str::trim).filter(|l| !l.is_empty()).collect();
+        let remove_ws = |s: &str| -> String { s.chars().filter(|c| !py_is_space(*c)).collect() };
+        let mut idx = 0usize;
+        let mut taxcount: i64 = 0;
+        let mut first_block = true;
+        let mut refseq: Vec<char> = Vec::new();
+        loop {
+            let Some(line) = lines.get(idx) else {
+                if taxcount < self.ntax {
+                    return Err(bio_nexus_err("Not enough taxa in matrix."));
+                } else if taxcount > self.ntax {
+                    return Err(bio_nexus_err("Too many taxa in matrix."));
+                }
+                break;
+            };
+            idx += 1;
+            taxcount += 1;
+            if taxcount > self.ntax {
+                if !self.interleave {
+                    return Err(bio_nexus_err("Too many taxa in matrix - should matrix be interleaved?"));
+                }
+                taxcount = 1;
+                first_block = false;
+            }
+            let lchars: Vec<char> = line.chars().collect();
+            let (word, pos) = bio_next_word(&lchars, 0);
+            let id = bio_quotestrip(&word.unwrap_or_default());
+            let rest: String = lchars[pos.min(lchars.len())..].iter().collect();
+            let rest = rest.trim();
+            let mut chars: String;
+            if self.interleave {
+                if !rest.is_empty() {
+                    chars = remove_ws(rest);
+                } else {
+                    let next = lines.get(idx).ok_or_else(bio_stop_iteration)?;
+                    idx += 1;
+                    chars = remove_ws(next);
+                }
+            } else {
+                chars = remove_ws(rest);
+                while (chars.chars().count() as i64) < self.nchar {
+                    let next = lines.get(idx).ok_or_else(bio_stop_iteration)?;
+                    idx += 1;
+                    chars.push_str(&remove_ws(next));
+                }
+            }
+            let typed = self.typed.as_ref().ok_or_else(|| bio_nexus_err("Unknown command: matrix "))?;
+            let tokens: Vec<String> = if self.datatype != "standard" {
+                let mut seq = bio_replace_parenthesized(&chars, &typed.rev)?;
+                if taxcount == 1 {
+                    refseq = seq.clone();
+                } else if let Some(mc) = self.matchchar {
+                    for p in 0..seq.len() {
+                        if seq[p] == mc {
+                            seq[p] = *refseq
+                                .get(p)
+                                .ok_or_else(|| BioErr::Py(PyIndexError::new_err("string index out of range")))?;
+                        }
+                    }
+                }
+                for &c in &seq {
+                    if !typed.valid.contains(c) && c != self.gap && c != self.missing {
+                        return Err(bio_nexus_err(format!(
+                            "Taxon {id}: Illegal character {c} in sequence {} (check dimensions/interleaving)",
+                            seq.iter().collect::<String>()
+                        )));
+                    }
+                }
+                seq.iter().map(|c| c.to_string()).collect()
+            } else {
+                let codings = bio_standard_data(&chars)?;
+                for coding in &codings {
+                    for &c in &coding.1 {
+                        if !typed.valid.contains(c) && c != self.gap && c != self.missing {
+                            let shown: String = codings.iter().map(bio_standard_token).collect();
+                            return Err(bio_nexus_err(format!(
+                                "Taxon {id}: Illegal character {c} in sequence {shown} (check dimensions/interleaving)"
+                            )));
+                        }
+                    }
+                }
+                codings.iter().map(bio_standard_token).collect()
+            };
+            if first_block {
+                self.unaltered.push(id.clone());
+                let uid = bio_unique_label(self.matrix.keys(), &id)?;
+                self.matrix.insert(uid.clone(), tokens);
+                self.taxlabels.push(uid);
+            } else {
+                let uid = bio_unique_label(self.taxlabels[..(taxcount - 1) as usize].iter(), &id)?;
+                match self.check_taxlabels(&uid).and_then(|t| self.matrix.get_mut(&t)) {
+                    Some(existing) => existing.extend(tokens),
+                    None => {
+                        return Err(bio_nexus_err(format!(
+                            "Taxon {uid} not in first block of interleaved matrix. Check matrix dimensions and interleave."
+                        )))
+                    }
+                }
+            }
+        }
+        for (taxon, seq) in &self.matrix {
+            if seq.len() as i64 != self.nchar {
+                return Err(bio_nexus_err(format!(
+                    "Matrix Nchar {} does not match data length ({}) for taxon {taxon}",
+                    self.nchar,
+                    seq.len()
+                )));
+            }
+        }
+        let mut keys: Vec<&String> = self.matrix.keys().collect();
+        keys.sort();
+        let mut labels: Vec<&String> = self.taxlabels.iter().collect();
+        labels.sort();
+        if keys != labels {
+            return Err(BioErr::Py(PyValueError::new_err(
+                "ERROR: TAXLABELS must be identical with MATRIX. Please Report this as a bug, and send in data file.",
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// ``Bio.AlignIO.read(text, "nexus")`` as ``(name, site tokens)`` rows.
+fn bio_read_alignment(py: Python<'_>, text: &str) -> Result<Vec<(String, Vec<String>)>, BioErr> {
+    let mut state = BioNexus::new();
+    for (title, lines) in bio_blocks(bio_commandlines(text)?)? {
+        if !BIO_KNOWN_BLOCKS.contains(&title.as_str()) {
+            continue;
+        }
+        for line in lines {
+            let cmd = bio_commandline(&line)?;
+            match cmd.command.as_str() {
+                "dimensions" => state.dimensions(py, &cmd.options)?,
+                "format" => state.format(&cmd.options)?,
+                "matrix" => state.matrix(&cmd.raw)?,
+                "charstatelabels" => {
+                    if state.symbols.as_ref().is_none_or(|s| s.is_empty()) {
+                        return Err(bio_nexus_err("Symbols must be defined when using character states"));
+                    }
+                }
+                other if BIO_COMMANDS.contains(&other) => {}
+                other => return Err(bio_nexus_err(format!("Unknown command: {other} "))),
+            }
+        }
+    }
+    if !state.have_matrix || state.matrix.is_empty() {
+        return Err(BioErr::Py(PyValueError::new_err("No records found in handle")));
+    }
+    let mut rows = Vec::with_capacity(state.unaltered.len());
+    for (old, new) in state.unaltered.iter().zip(state.taxlabels.iter()) {
+        let tokens = state.matrix.get(new).cloned().unwrap_or_default();
+        rows.push((old.clone(), tokens));
+    }
+    Ok(rows)
+}
+
+/// ``MSA.parse``'s reader: the ``(taxon, site tokens)`` rows of a NEXUS
+/// file's DATA/CHARACTERS matrix, as ``Bio.AlignIO.read(path, "nexus")``
+/// produced them, or as python-nexus produced them when BioPython raised
+/// ``NexusError``.
+#[pyfunction]
+fn io_read_nexus_alignment(py: Python<'_>, filepath: &str) -> PyResult<Vec<(String, Vec<String>)>> {
+    let path = Path::new(filepath);
+    if !(path.exists() && path.is_file()) {
+        return Err(PyFileNotFoundError::new_err(format!("Nexus file not found: {filepath}")));
+    }
+    let nexus_text = read_nexus_text(py, filepath)?;
+    // BioPython read the file with the default codec, keeping a byte-order mark.
+    let bio_text = if path.extension().is_some_and(|e| e == "gz") {
+        nexus_text.clone()
+    } else {
+        let bytes = fs::read(path).map_err(|e| PyOSError::new_err(os_error_message(&e, filepath)))?;
+        decode_with_python(py, &bytes, "utf-8")?
+    };
+    match bio_read_alignment(py, &bio_text) {
+        Ok(rows) => Ok(rows),
+        Err(BioErr::Py(e)) => Err(e),
+        Err(BioErr::Nexus(_)) => nexus_read(py, &nexus_text)?
+            .data
+            .ok_or_else(|| PyTypeError::new_err("'NoneType' object is not iterable")),
+    }
 }
 
 /// The ``read_nexus`` loop: each tree line becomes a ``Network``; a line the
@@ -1947,6 +3085,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_register_io_error, m)?)?;
     m.add_function(wrap_pyfunction!(io_read_newick, m)?)?;
     m.add_function(wrap_pyfunction!(io_nexus_tree_lines, m)?)?;
+    m.add_function(wrap_pyfunction!(io_read_nexus_alignment, m)?)?;
     m.add_function(wrap_pyfunction!(io_networks_from_nexus_trees, m)?)?;
     m.add_function(wrap_pyfunction!(io_read_fasta_records, m)?)?;
     m.add_function(wrap_pyfunction!(io_write_fasta, m)?)?;

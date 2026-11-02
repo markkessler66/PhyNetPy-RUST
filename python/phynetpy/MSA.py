@@ -31,11 +31,7 @@ from typing import Any, Union
 import warnings
 from collections import Counter
 from itertools import combinations
-from Bio.Nexus.Nexus import NexusError
-from Bio import AlignIO
-from nexus import NexusReader
-from Bio.AlignIO import MultipleSeqAlignment
-from Bio.SeqRecord import SeqRecord
+from . import _core
 
 
 
@@ -459,51 +455,22 @@ class MSA(Iterable[DataSequence]):
                 self.hash[gid] = [] 
                 gid += 1
         
-        #Now parse
-        try:
-            # If the nexus file is in a Biopython supported data type
-            msa : MultipleSeqAlignment = AlignIO.read(self.filename, "nexus")
-            index = 0
-
-            rec : SeqRecord
-            for rec in list(msa):
-                if self.grouping is None:  # Do nothing special, no GID applied
-                    new_record = DataSequence(rec.seq, rec.name, gid = index)
-                    recs.append(new_record)
-                    self.hash[index] = [new_record]
-                    index += 1
-                else:
-                    # assign new DataSequence its own correct GID based on grouping 
-                    # specified
-                    new_record = DataSequence(rec.seq, 
-                                           rec.name, 
-                                           gid = self.get_category(rec.name))
-                    recs.append(new_record)
-                    self.hash[new_record.get_gid()].append(new_record)
-                    index += 1
-        except NexusError:
-            # do same as above, just using the NexusReader as a work-around.
-            reader : NexusReader = NexusReader.from_file(self.filename)
-        
-            recs = []
-            index = 0
-            for taxa_data_pair in reader.data: # type: ignore
-
-                #Where taxa is index 0, sequence is index 1
-                if self.grouping is None:
-                    new_record = DataSequence(taxa_data_pair[1],
-                                           taxa_data_pair[0],
-                                           gid = index)
-                    recs.append(new_record)
-                    self.hash[index] = [new_record]
-                    index += 1
-                else:
-                    new_record = DataSequence(taxa_data_pair[1], 
-                                           taxa_data_pair[0],
-                                           gid = self.get_category(taxa_data_pair[0]))
-                    recs.append(new_record)
-                    self.hash[new_record.get_gid()].append(new_record)
-                    index += 1         
+        #Now parse. The core reads the DATA/CHARACTERS matrix the way the
+        #two libraries this module used to call did: BioPython's reader
+        #first, python-nexus' reader where BioPython rejected the file.
+        index = 0
+        for name, sites in _core.io_read_nexus_alignment(self.filename):
+            if self.grouping is None:  # Do nothing special, no GID applied
+                new_record = DataSequence(sites, name, gid = index)
+                recs.append(new_record)
+                self.hash[index] = [new_record]
+            else:
+                # assign new DataSequence its own correct GID based on grouping 
+                # specified
+                new_record = DataSequence(sites, name, gid = self.get_category(name))
+                recs.append(new_record)
+                self.hash[new_record.get_gid()].append(new_record)
+            index += 1
           
         return recs
 
@@ -580,10 +547,8 @@ class MSA(Iterable[DataSequence]):
         Returns:
             dict[int, str]: a grouping map from gid's to sequence names
         """
-        reader = NexusReader.from_file(self.filename)
-        data = list[Any]()
-        for taxa, chars in reader.data:
-            data.append(taxa)
+        data = [taxa for taxa, _chars in
+                _core.io_read_nexus_alignment(self.filename)]
         
         groups = group_some_strings(data)
         

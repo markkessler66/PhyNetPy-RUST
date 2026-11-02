@@ -114,7 +114,8 @@ struct PNode {
     gamma: Option<f64>,
 }
 
-fn py_float(s: &str) -> Option<f64> {
+/// Python's ``float(text)`` for the strings a Newick string can carry.
+pub fn py_float(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
         return None;

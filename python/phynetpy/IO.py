@@ -26,15 +26,16 @@ Approved for Release: No.
 IO module for PhyNetPy. Handles reading and writing of various phylogenetic
 file formats, starting with FASTA. Serves as the central I/O hub for all
 supported file formats.
+
+The parsers and writers run in the compiled core (``phynetpy._core``); this
+module keeps the public API, the ``IOError`` class and the glue that turns
+parsed records into ``DataSequence`` / ``MSA`` / ``GeneTrees`` objects.
 """
 
 from __future__ import annotations
 import os
-import re
-import textwrap
 import traceback
 import warnings
-from io import StringIO
 from pathlib import Path
 from typing import (
     Any,
@@ -49,12 +50,9 @@ from typing import (
     Union,
 )
 
-from Bio import Phylo, SeqIO
-from nexus import NexusReader
-
+from . import _core
 from .MSA import DataSequence, MSA
-from .Network import Edge, Network, Node, _complete_hybrid_gammas
-from .Newick import get_labels as _get_newick_labels
+from .Network import Edge, Network, Node
 from .GeneTrees import GeneTrees
 
 
@@ -75,6 +73,10 @@ class IOError(Exception):
         """
         self.message = message
         super().__init__(self.message)
+
+
+# The core raises this class for the failures the readers and writers report.
+_core._register_io_error(IOError)
 
 
 ###############################
@@ -105,36 +107,16 @@ def read_fasta_records(filepath: str) -> List[DataSequence]:
 
     Raises:
         FileNotFoundError: If the file does not exist.
-        IOError: If BioPython cannot parse the file or it contains no 
-                 valid sequences.
+        IOError: If the file cannot be parsed or it contains no valid 
+                 sequences.
 
     Returns:
         list[DataSequence]: A list of DataSequence objects, one per FASTA 
                             record.
     """
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"FASTA file not found: {filepath}")
-    
     records: List[DataSequence] = []
-    
-    try:
-        parsed = list(SeqIO.parse(filepath, "fasta"))
-    except Exception as e:
-        raise IOError(f"Failed to parse FASTA file '{filepath}': {str(e)}")
-    
-    if len(parsed) == 0:
-        raise IOError(
-            f"No valid FASTA sequences found in '{filepath}'. "
-            "Ensure the file starts with '>' header lines followed by "
-            "sequence data."
-        )
-    
-    for idx, bio_rec in enumerate(parsed):
-        seq_chars: list = list(str(bio_rec.seq))
-        name: str = bio_rec.id if bio_rec.id else f"seq_{idx}"
-        data_seq = DataSequence(seq_chars, name, gid=idx)
-        records.append(data_seq)
-    
+    for idx, (name, seq) in enumerate(_core.io_read_fasta_records(filepath)):
+        records.append(DataSequence(list(seq), name, gid=idx))
     return records
 
 
@@ -236,29 +218,7 @@ def write_fasta(msa: MSA, filepath: str, line_width: int = FASTA_LINE_WIDTH) -> 
     Returns:
         None
     """
-    if line_width < 1:
-        raise ValueError("line_width must be >= 1")
-    
-    records = msa.get_records()
-    if len(records) == 0:
-        raise IOError("Cannot write an empty MSA to FASTA: no records present.")
-    
-    try:
-        with open(filepath, 'w') as f:
-            for rec in records:
-                # Write the header line
-                f.write(f">{rec.get_name()}\n")
-                
-                # Join the sequence characters into a string
-                seq_str = "".join(str(c) for c in rec.get_seq())
-                
-                # Wrap the sequence at line_width characters
-                wrapped = textwrap.fill(seq_str, width=line_width, 
-                                        break_on_hyphens=False,
-                                        break_long_words=True)
-                f.write(wrapped + "\n")
-    except OSError as e:
-        raise IOError(f"Failed to write FASTA file '{filepath}': {str(e)}")
+    _core.io_write_fasta(msa, os.fspath(filepath), int(line_width))
 
 
 def write_fasta_from_network(
@@ -323,48 +283,6 @@ def write_fasta_from_network(
 #### VCF Reading Functions #
 ############################
 
-def _parse_vcf_genotype(gt_str: str) -> Optional[int]:
-    """
-    Parse a VCF genotype string into an allele count (number of ALT alleles).
-
-    Supported formats:
-        - "0/0" or "0|0" -> 0  (homozygous reference)
-        - "0/1" or "0|1" -> 1  (heterozygous)
-        - "1/1" or "1|1" -> 2  (homozygous alternate)
-        - "./." or ".|." -> None  (missing data)
-
-    For polyploid genotypes (e.g. "0/0/1"), the count is the sum of all
-    allele values.
-
-    Args:
-        gt_str (str): Genotype field from a VCF record (e.g. "0/1").
-
-    Returns:
-        int or None: The ALT allele count, or None if the genotype is 
-                     missing.
-    """
-    # Strip any additional format fields (GT may be followed by :DP:GQ etc.)
-    gt_field = gt_str.split(":")[0]
-    
-    # Determine separator (phased "|" or unphased "/")
-    if "|" in gt_field:
-        alleles = gt_field.split("|")
-    elif "/" in gt_field:
-        alleles = gt_field.split("/")
-    else:
-        # Single allele (haploid)
-        alleles = [gt_field]
-    
-    # Check for missing data
-    if any(a == "." for a in alleles):
-        return None
-    
-    try:
-        return sum(int(a) for a in alleles)
-    except ValueError:
-        return None
-
-
 def read_vcf(
     filepath: str,
     grouping: Optional[Dict[str, list]] = None,
@@ -410,96 +328,9 @@ def read_vcf(
         MSA: A Multiple Sequence Alignment where each DataSequence 
              represents one sample's genotype vector across all sites.
     """
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"VCF file not found: {filepath}")
-    
-    sample_names: List[str] = []
-    # Each sample accumulates a list of allele counts across sites
-    sample_genotypes: Dict[str, List] = {}
-    metadata_lines: List[str] = []
-    num_variants: int = 0
-    
-    try:
-        with open(filepath, 'r') as f:
-            for line in f:
-                line = line.rstrip('\n')
-                
-                # Meta-information lines
-                if line.startswith("##"):
-                    metadata_lines.append(line)
-                    continue
-                
-                # Header line with sample names
-                if line.startswith("#CHROM") or line.startswith("#chrom"):
-                    fields = line.split("\t")
-                    # Columns 0-8 are fixed: CHROM POS ID REF ALT QUAL 
-                    # FILTER INFO FORMAT
-                    # Columns 9+ are sample names
-                    if len(fields) < 10:
-                        raise IOError(
-                            "VCF header line has fewer than 10 columns. "
-                            "Expected at least: #CHROM POS ID REF ALT QUAL "
-                            "FILTER INFO FORMAT <sample1>"
-                        )
-                    sample_names = fields[9:]
-                    for sname in sample_names:
-                        sample_genotypes[sname] = []
-                    continue
-                
-                # Skip empty lines
-                if not line.strip():
-                    continue
-                
-                # Data lines
-                fields = line.split("\t")
-                if len(fields) < 10:
-                    continue  # Malformed line, skip
-                
-                # Find the GT field position in FORMAT
-                fmt = fields[8]
-                fmt_fields = fmt.split(":")
-                try:
-                    gt_index = fmt_fields.index("GT")
-                except ValueError:
-                    # No GT field in this record, skip
-                    warnings.warn(
-                        f"VCF line at position {fields[1]} has no GT "
-                        f"field in FORMAT column; skipping."
-                    )
-                    continue
-                
-                num_variants += 1
-                
-                # Parse each sample's genotype
-                for i, sname in enumerate(sample_names):
-                    if 9 + i < len(fields):
-                        sample_field = fields[9 + i]
-                        sample_fmt = sample_field.split(":")
-                        if gt_index < len(sample_fmt):
-                            gt = _parse_vcf_genotype(sample_fmt[gt_index])
-                        else:
-                            gt = None
-                    else:
-                        gt = None
-                    
-                    if gt is not None:
-                        sample_genotypes[sname].append(str(gt))
-                    else:
-                        sample_genotypes[sname].append(missing_value)
-    
-    except OSError as e:
-        raise IOError(f"Failed to read VCF file '{filepath}': {str(e)}")
-    
-    if not sample_names:
-        raise IOError(
-            f"No sample columns found in VCF file '{filepath}'. "
-            "Ensure the file has a #CHROM header line with sample names."
-        )
-    
-    if num_variants == 0:
-        raise IOError(
-            f"No variant records found in VCF file '{filepath}'."
-        )
+    sample_names, sample_genotypes = _core.io_read_vcf_records(
+        os.fspath(filepath), missing_value
+    )
     
     # Build DataSequence objects
     records: List[DataSequence] = []
@@ -562,58 +393,7 @@ def read_vcf_metadata(filepath: str) -> Dict[str, Any]:
             - "filter_fields": List of FILTER field IDs
             - "contig_fields": List of contig IDs
     """
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"VCF file not found: {filepath}")
-    
-    result: Dict[str, Any] = {
-        "fileformat": "",
-        "metadata_lines": [],
-        "sample_names": [],
-        "info_fields": [],
-        "format_fields": [],
-        "filter_fields": [],
-        "contig_fields": [],
-    }
-    
-    try:
-        with open(filepath, 'r') as f:
-            for line in f:
-                line = line.rstrip('\n')
-                
-                if line.startswith("##fileformat"):
-                    result["fileformat"] = line.split("=", 1)[1]
-                    result["metadata_lines"].append(line)
-                elif line.startswith("##INFO"):
-                    result["metadata_lines"].append(line)
-                    match = re.search(r'ID=([^,>]+)', line)
-                    if match:
-                        result["info_fields"].append(match.group(1))
-                elif line.startswith("##FORMAT"):
-                    result["metadata_lines"].append(line)
-                    match = re.search(r'ID=([^,>]+)', line)
-                    if match:
-                        result["format_fields"].append(match.group(1))
-                elif line.startswith("##FILTER"):
-                    result["metadata_lines"].append(line)
-                    match = re.search(r'ID=([^,>]+)', line)
-                    if match:
-                        result["filter_fields"].append(match.group(1))
-                elif line.startswith("##contig"):
-                    result["metadata_lines"].append(line)
-                    match = re.search(r'ID=([^,>]+)', line)
-                    if match:
-                        result["contig_fields"].append(match.group(1))
-                elif line.startswith("##"):
-                    result["metadata_lines"].append(line)
-                elif line.startswith("#CHROM") or line.startswith("#chrom"):
-                    fields = line.split("\t")
-                    if len(fields) >= 10:
-                        result["sample_names"] = fields[9:]
-                    break  # Done with header
-    except OSError as e:
-        raise IOError(f"Failed to read VCF file '{filepath}': {str(e)}")
-    
-    return result
+    return _core.io_read_vcf_metadata(os.fspath(filepath))
 
 
 ############################
@@ -661,438 +441,15 @@ def write_vcf(
     Returns:
         None
     """
-    records = msa.get_records()
-    if len(records) == 0:
-        raise IOError("Cannot write an empty MSA to VCF: no records present.")
-    
-    sample_names = [rec.get_name() for rec in records]
-    num_sites = len(records[0].get_seq())
-    
-    try:
-        with open(filepath, 'w') as f:
-            # Write VCF header
-            f.write("##fileformat=VCFv4.1\n")
-            f.write('##FORMAT=<ID=GT,Number=1,Type=String,'
-                     'Description="Genotype">\n')
-            f.write("##source=PhyNetPy\n")
-            
-            # Write column header
-            header_cols = [
-                "#CHROM", "POS", "ID", "REF", "ALT", 
-                "QUAL", "FILTER", "INFO", "FORMAT"
-            ] + sample_names
-            f.write("\t".join(header_cols) + "\n")
-            
-            # Write variant records
-            for site_idx in range(num_sites):
-                pos = start_pos + site_idx
-                
-                # Build genotype strings for each sample
-                genotypes: List[str] = []
-                for rec in records:
-                    seq = rec.get_seq()
-                    if site_idx < len(seq):
-                        val = seq[site_idx]
-                        gt = _allele_count_to_gt(val)
-                    else:
-                        gt = "./."
-                    genotypes.append(gt)
-                
-                fields = [
-                    chrom,
-                    str(pos),
-                    ".",
-                    ref_allele,
-                    alt_allele,
-                    ".",
-                    "PASS",
-                    ".",
-                    "GT"
-                ] + genotypes
-                
-                f.write("\t".join(fields) + "\n")
-    
-    except OSError as e:
-        raise IOError(f"Failed to write VCF file '{filepath}': {str(e)}")
-
-def _allele_count_to_gt(value: Any) -> str:
-    """
-    Convert an allele count value back to VCF genotype notation.
-
-    Assumes diploid (2 alleles). For higher ploidy, the genotype is 
-    constructed by distributing ALT alleles across allele slots.
-
-    Args:
-        value (Any): The allele count (0, 1, 2, ...) or a missing 
-                      data marker ("?", ".", etc.).
-
-    Returns:
-        str: A VCF genotype string (e.g. "0/0", "0/1", "1/1", "./.").
-    """
-    # Handle missing data
-    if value in ("?", ".", "-", None, "None"):
-        return "./."
-    
-    try:
-        count = int(value)
-    except (ValueError, TypeError):
-        return "./."
-    
-    # Diploid genotype reconstruction
-    if count == 0:
-        return "0/0"
-    elif count == 1:
-        return "0/1"
-    elif count == 2:
-        return "1/1"
-    else:
-        # Higher ploidy: distribute ALT alleles
-        # e.g., count=3 with ploidy inferred as count -> "0/1/1/1"
-        # For simplicity, assume count is num ALT out of ploidy = count
-        # This is a best-effort reconstruction
-        num_alt = min(count, count)
-        num_ref = 0
-        alleles = ["0"] * num_ref + ["1"] * num_alt
-        return "/".join(alleles)
+    _core.io_write_vcf(
+        msa, os.fspath(filepath), str(chrom), start_pos,
+        str(ref_allele), str(alt_allele),
+    )
 
 
 ##################################
 #### Newick Reading Functions ####
 ##################################
-
-def _merge_attributes(inheritances: Dict[str, Dict],
-                      parsed_node: Node,
-                      attr1: dict,
-                      attr2: dict) -> dict:
-    """
-    Given two attribute dictionaries, combine them into one, taking the 
-    union of the two.  Used when a reticulation node is encountered from 
-    a second parent.
-
-    Args:
-        inheritances (dict[str, dict]): A mapping from node names to their 
-                                        gamma entries.
-        parsed_node (Node): The node for which to combine attributes parsed 
-                            for different parents. Should be a reticulation 
-                            node.
-        attr1 (dict): The attribute dict derived from the first parent.
-        attr2 (dict): The attribute dict derived from the second parent.
-
-    Returns:
-        dict: A combined attribute dictionary.
-    """
-    final_attr: Dict[Any, Any] = {}
-    if "eventType" in attr1:
-        final_attr["eventType"] = attr1["eventType"]
-    if "index" in attr1:
-        final_attr["index"] = attr1["index"]
-
-    if parsed_node.label in inheritances:
-        final_attr["gamma"] = inheritances[parsed_node.label]
-    return final_attr
-
-
-def _parse_reticulation_attributes(attr_str: str) -> Tuple[str, int]:
-    """
-    Takes the formatting string from extended newick grammar and parses 
-    it into the event type and index.
-
-    Examples:
-        - "H1"    -> ("Hybridization", 1)
-        - "LGT21" -> ("Lateral Gene Transfer", 21)
-        - "R3"    -> ("Recombination", 3)
-        - "UID_7" -> ("Hybridization", 7)   (any other prefix)
-
-    Args:
-        attr_str (str): A node name suffix carrying reticulation event 
-                        information (after the '#').
-
-    Raises:
-        IOError: If the label format is invalid.
-
-    Returns:
-        tuple[str, int]: (event_type, index)
-    """
-    if not attr_str:
-        raise IOError("Reticulation event label formatting incorrect")
-
-    index_lookup = 0
-
-    if attr_str[0] == "R":
-        event = "Recombination"
-        index_lookup = 1
-    elif attr_str[0] == "H":
-        event = "Hybridization"
-        index_lookup = 1
-    elif attr_str[0] == "L":
-        if len(attr_str) >= 3 and attr_str[1] == "G" and attr_str[2] == "T":
-            event = "Lateral Gene Transfer"
-            index_lookup = 3
-        else:
-            raise IOError("Invalid reticulation label format (event error)")
-    else:
-        # Not an extended-Newick event code. Networks built in memory carry
-        # labels such as "#UID_6057" (see Network.add_uid_node), and other
-        # tools write "#1" or "#h1"; treat them all as hybridizations and
-        # keep any trailing digits as the index.
-        digits = re.search(r"(\d+)$", attr_str)
-        return "Hybridization", int(digits.group(1)) if digits else -1
-
-    try:
-        num = int(attr_str[index_lookup:])
-        return event, num
-    except ValueError:
-        raise IOError("Invalid reticulation label format (number error)")
-
-
-class _NewickTreeBuilder:
-    """
-    Internal helper that converts a BioPython Tree object into a PhyNetPy 
-    Network. This replicates the logic from NetworkParser.parse_tree_block 
-    and its associated methods but in a standalone, reusable form.
-    """
-
-    def __init__(self) -> None:
-        """Create a new ``_NewickTreeBuilder`` with fresh per-build state."""
-        self._internal_count: int = 0
-        self._inheritance: Dict[str, Dict] = {}
-        # Hybrid edges whose gamma the string gave (directly or as the
-        # complement of an earlier occurrence); the rest are completed in build.
-        self._explicit_edges: set = set()
-
-    def build(self, tree: Any) -> Network:
-        """
-        Given a BioPython Tree object, walk through it and build a 
-        PhyNetPy Network.
-
-        Args:
-            tree (Any): A BioPython Phylo.BaseTree.Tree object.
-
-        Returns:
-            Network: A PhyNetPy Network with the same topology, names, 
-                     and branch lengths as the input tree.
-        """
-        # Build a parent dictionary from the BioPython tree
-        parents: Dict[Any, Any] = {}
-        for clade in tree.find_clades(order="level"):
-            for child in clade:
-                parents[child] = clade
-
-        net = Network()
-
-        for node, par in parents.items():
-            parent_node = self._parse_parent(par, net)
-            self._parse_child(node, net, parent_node)
-
-        # A reticulation whose first occurrence carried no gamma had that
-        # edge created before the second occurrence supplied one.
-        _complete_hybrid_gammas(net, self._explicit_edges)
-        return net
-
-    def _parse_comment(self, node: Any, parent: Node) -> dict:
-        """
-        Examine the comment block of a BioPython clade to extract 
-        reticulation attributes (gamma/inheritance probabilities).
-
-        Args:
-            node (Any): A BioPython clade node.
-            parent (Node): The PhyNetPy parent node.
-
-        Returns:
-            dict: An attribute dictionary for the node.
-        """
-        attr: dict = {}
-        # Non-reticulation nodes: just forward the raw comment, if any
-        if node.name is None or node.name[0] != "#":
-            if node.comment is not None:
-                attr["comment"] = node.comment
-            return attr
-
-        # ── Reticulation node (#H0, #LGT1, etc.) ──
-        event, num = _parse_reticulation_attributes(node.name.split("#")[1])
-        attr["eventType"] = event
-        attr["index"] = num
-
-        # A reticulation has exactly two parent edges. We need to pair them
-        # and assign inheritance probabilities (gamma). BioPython delivers
-        # the two occurrences of the same #-name in separate calls, so
-        # self._inheritance accumulates partial info across calls.
-        #
-        # Three cases:
-        #   1) Comment contains "&gamma=X" → explicit gamma
-        #   2) Comment is something else    → unrelated metadata
-        #   3) No comment at all            → gamma must be inferred
-        if node.comment is not None:
-            if node.comment.split("=")[0] == "&gamma":
-                gamma = float(node.comment.split("=")[1])
-                attr["gamma"] = {parent.label: [gamma, node.branch_length]}
-
-                if node.name in self._inheritance:
-                    # Second occurrence: pair with the first parent's entry
-                    for par, info in self._inheritance[node.name].items():
-                        if info[0] == -1:
-                            # First parent had no explicit gamma → derive it
-                            old_info = [1 - gamma, info[1]]
-                            self._inheritance[node.name] = {
-                                par: old_info,
-                                parent.label: [gamma, node.branch_length]
-                            }
-                        else:
-                            # Both parents gave explicit gammas → must sum to 1
-                            if info[0] + gamma != 1:
-                                raise IOError(
-                                    "Gamma values provided in newick string "
-                                    "do not add to 1"
-                                )
-                            self._inheritance[node.name] = {
-                                par: info,
-                                parent.label: [gamma, node.branch_length]
-                            }
-                        break
-                else:
-                    # First occurrence of this retic name
-                    self._inheritance[node.name] = {
-                        parent.label: [gamma, node.branch_length]
-                    }
-            else:
-                attr["comment"] = node.comment
-        else:
-            # No gamma annotation on this edge
-            if node.name in self._inheritance:
-                # Second occurrence: pair with previously stored parent
-                for par, info in self._inheritance[node.name].items():
-                    if info[0] == -1:
-                        # Neither parent specified gamma → default to 0.5/0.5
-                        gammas = {
-                            par: [0.5, info[1]],
-                            parent.label: [0.5, node.branch_length]
-                        }
-                        self._inheritance[node.name] = gammas
-                    else:
-                        # First parent had explicit gamma → complement it
-                        self._inheritance[node.name] = {
-                            par: info,
-                            parent.label: [1 - info[0], node.branch_length]
-                        }
-                    break
-            else:
-                # First occurrence without gamma → mark as -1 (unknown)
-                self._inheritance[node.name] = {
-                    parent.label: [-1, node.branch_length]
-                }
-
-        return attr
-
-    def _parse_parent(self, node: Any, network: Network,
-                      parent: Optional[Node] = None) -> Node:
-        """
-        Process a parent node from the BioPython tree.
-
-        Args:
-            node (Any): A BioPython clade.
-            network (Network): The partially built PhyNetPy Network.
-            parent (Node, optional): The parent of this node. Defaults 
-                                     to None (root).
-
-        Returns:
-            Node: The PhyNetPy Node for this clade.
-        """
-        parsed_node: Optional[Node] = network.has_node_named(node.name)
-
-        if parsed_node is not None:
-            return parsed_node
-
-        if node.name is None:
-            node.name = "Internal" + str(self._internal_count)
-            self._internal_count += 1
-
-        parsed_node = Node(name=node.name)
-
-        if parent is None:
-            parsed_node.set_time(0)
-        else:
-            par_time = parent.get_time()
-            if node.branch_length is not None:
-                parsed_node.set_time(par_time + node.branch_length)
-            else:
-                warnings.warn(
-                    "No branch length provided for node; setting to 1."
-                )
-                parsed_node.set_time(par_time + 1)
-
-        if node.name[0] == "#":
-            parsed_node.set_is_reticulation(True)
-
-        if parent is not None:
-            parsed_node.set_attributes(self._parse_comment(node, parent))
-
-        network.add_nodes(parsed_node)
-        return parsed_node
-
-    def _parse_child(self, node: Any, network: Network,
-                     parent: Node) -> Node:
-        """
-        Process a child node from the BioPython tree.
-
-        Args:
-            node (Any): A BioPython clade.
-            network (Network): The partially built PhyNetPy Network.
-            parent (Node): The already-processed parent node.
-
-        Returns:
-            Node: The PhyNetPy Node for this clade.
-        """
-        parsed_node: Optional[Node] = network.has_node_named(node.name)
-
-        if parsed_node is not None:
-            more_attr = self._parse_comment(node, parent)
-            parsed_node.set_attributes(
-                _merge_attributes(
-                    self._inheritance, parsed_node,
-                    more_attr, parsed_node.get_attributes()
-                )
-            )
-        else:
-            if node.name is None:
-                node.name = "Internal" + str(self._internal_count)
-                self._internal_count += 1
-
-            parsed_node = Node(name=node.name)
-
-            if node.name[0] == "#":
-                parsed_node.set_is_reticulation(True)
-
-            if node.branch_length is not None:
-                parsed_node.set_time(parent.get_time() + node.branch_length)
-            else:
-                warnings.warn(
-                    "No branch length provided for node; setting to 1."
-                )
-                parsed_node.set_time(parent.get_time() + 1)
-
-            parsed_node.set_attributes(self._parse_comment(node, parent))
-            network.add_nodes(parsed_node)
-
-        # Create edge from parent to child
-        new_edge = Edge(parent, parsed_node)
-
-        if node.branch_length is not None:
-            new_edge.set_length(node.branch_length)
-        else:
-            new_edge.set_length(1)
-
-        # Set gamma if applicable. -1 marks a parent whose gamma is still
-        # unknown; it is completed once every occurrence has been read.
-        inheritance_prob = parsed_node.attribute_value("gamma")
-        if inheritance_prob is not None:
-            gamma_value = inheritance_prob.get(parent.label, [None])[0]
-            if gamma_value is not None and gamma_value >= 0:
-                new_edge.set_gamma(gamma_value)
-                self._explicit_edges.add(new_edge)
-
-        network.add_edges(new_edge)
-        return parsed_node
-
 
 def read_newick(newick_str: str) -> Network:
     """
@@ -1118,18 +475,7 @@ def read_newick(newick_str: str) -> Network:
         Network: A PhyNetPy Network object with the same topology, names, 
                  and branch lengths as described in the newick string.
     """
-    newick_str = newick_str.strip()
-    if not newick_str:
-        raise IOError("Cannot parse an empty newick string.")
-
-    try:
-        handle = StringIO(newick_str)
-        tree = Phylo.read(handle, "newick")
-    except Exception as e:
-        raise IOError(f"Failed to parse newick string: {str(e)}")
-
-    builder = _NewickTreeBuilder()
-    return builder.build(tree)
+    return _core.io_read_newick(newick_str)
 
 
 ####################################
@@ -1444,15 +790,7 @@ def write_newick_file(
     Returns:
         None
     """
-    if not networks:
-        raise IOError("No networks provided to write.")
-
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            for net in networks:
-                f.write(write_newick(net) + "\n")
-    except OSError as e:
-        raise IOError(f"Failed to write newick file '{filepath}': {str(e)}")
+    _core.io_write_newick_file(networks, os.fspath(filepath))
 
 
 ##################################
@@ -1510,6 +848,7 @@ def read_nexus(
     Returns:
         list[Network] | GeneTrees: Parsed phylogenetic data.
     """
+    filepath = os.fspath(filepath)
     if not os.path.exists(filepath):
         raise FileNotFoundError(f"Nexus file not found: {filepath}")
 
@@ -1525,9 +864,9 @@ def read_nexus(
         except Exception as e:
             warnings.warn(f"Validation failed: {str(e)}")
 
-    # Parse using NexusReader
+    # Split the file into blocks and pull the TREES block's tree lines
     try:
-        reader = NexusReader.from_file(filepath)
+        tree_lines = _core.io_nexus_tree_lines(filepath)
     except Exception as e:
         traceback.print_exc()
         raise IOError(
@@ -1535,31 +874,10 @@ def read_nexus(
             f"{str(e)}"
         )
 
-    if reader.trees is None:
+    if tree_lines is None:
         raise IOError(f"No trees listed in nexus file '{filepath}'.")
 
-    networks: List[Network] = []
-    name_map: Dict[str, Network] = {}
-
-    for t in reader.trees:
-        tree_str = str(t)
-        parts = tree_str.split("=", 1)
-        name = parts[0].split()[1] if len(parts[0].split()) > 1 else f"tree_{len(networks)}"
-        newick_part = parts[1] if len(parts) > 1 else tree_str
-
-        handle = StringIO(newick_part)
-        try:
-            bio_tree = Phylo.read(handle, "newick")
-        except Exception as e:
-            warnings.warn(
-                f"Failed to parse tree '{name}' in nexus file: {str(e)}"
-            )
-            continue
-
-        builder = _NewickTreeBuilder()
-        network = builder.build(bio_tree)
-        networks.append(network)
-        name_map[name] = network
+    networks: List[Network] = _core.io_networks_from_nexus_trees(tree_lines)
 
     if not networks:
         raise IOError(
@@ -1664,52 +982,10 @@ def write_nexus(
     Returns:
         None
     """
-    if not networks:
-        raise IOError("No networks provided to write.")
-
-    if not overwrite and os.path.exists(filepath):
-        raise IOError(f"File already exists: {filepath}")
-
-    # Generate newick strings and collect taxa
-    newick_strings: List[str] = []
-    all_taxa: Set[str] = set()
-
-    for net in networks:
-        nwk = write_newick(net)
-        newick_strings.append(nwk)
-        all_taxa |= _get_newick_labels(nwk)
-
-    # Use explicitly provided taxa if given
-    if taxa is not None:
-        all_taxa = taxa
-
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            # Header
-            f.write("#NEXUS\n\n")
-
-            # TAXA block — put all labels on one line so that
-            # NexusReader does not count the terminating ';' as a taxon.
-            f.write("BEGIN TAXA;\n")
-            f.write(f"DIMENSIONS NTAX={len(all_taxa)};\n")
-            f.write("TAXLABELS " + " ".join(sorted(all_taxa)) + ";\n")
-            f.write("END;\n")
-
-            # TREES block
-            f.write("BEGIN TREES;\n")
-            for idx, nwk in enumerate(newick_strings, start=1):
-                f.write(f"Tree {tree_prefix}{idx} = {nwk}\n")
-            f.write("END;\n")
-
-            # Optional PHYLONET block
-            if phylonet_cmds:
-                f.write("BEGIN PHYLONET;\n")
-                for cmd in phylonet_cmds:
-                    f.write(cmd + "\n")
-                f.write("END;\n")
-
-    except OSError as e:
-        raise IOError(f"Failed to write nexus file '{filepath}': {str(e)}")
+    _core.io_write_nexus(
+        networks, os.fspath(filepath), taxa, tree_prefix, overwrite,
+        phylonet_cmds,
+    )
 
 
 ##########################################
@@ -1741,21 +1017,7 @@ def detect_newick_standard(newick_str: str) -> str:
     Returns:
         str: One of ``"Phylonet"``, ``"Beast"``, or ``"PhyNetPy"``.
     """
-    s = newick_str.strip()
-
-    # PhyloNet: double-colon gamma on reticulation nodes
-    if re.search(r'#[A-Za-z_]\w*(?::' + _NUM_RE + r')?::' + _NUM_RE, s):
-        return "Phylonet"
-
-    # BEAST: [&R] or [&U] rooted/unrooted prefix
-    if re.match(r'^\[&[RU]\]', s):
-        return "Beast"
-
-    # PhyNetPy: [&gamma=X] comment annotation
-    if re.search(r'\[&[^\]]*gamma=', s):
-        return "PhyNetPy"
-
-    return "PhyNetPy"
+    return _core.io_detect_newick_standard(newick_str)
 
 
 def convert_newick(newick_str: str, standard: str = "PhyNetPy") -> str:
@@ -1798,92 +1060,4 @@ def convert_newick(newick_str: str, standard: str = "PhyNetPy") -> str:
     Returns:
         str: The newick string reformatted for the target software.
     """
-    if standard not in _VALID_STANDARDS:
-        raise ValueError(
-            f"Invalid standard '{standard}'. Must be one of: "
-            f"{', '.join(sorted(_VALID_STANDARDS))}"
-        )
-
-    s = newick_str.strip()
-    if not s:
-        raise IOError("Cannot convert an empty newick string.")
-
-    # ---- Step 1: Strip BEAST [&R]/[&U] prefix if present ----
-    s = re.sub(r'^\[&[RU]\]\s*', '', s)
-
-    # ---- Step 2: Normalize PhyloNet :: notation to [&gamma=X] ----
-    # Match: #ReticName followed by optional :branch_length, then ::gamma
-    # PhyloNet format:  #H0:0.05::0.7
-    # PhyNetPy format:  #H0[&gamma=0.7]:0.05
-    phylonet_pattern = (
-        r'(#[A-Za-z_]\w*)'                   # Group 1: retic name
-        r'(:' + _NUM_RE + r')?'               # Group 2: optional :branch
-        r'::(' + _NUM_RE + r')'               # Group 3: gamma value
-    )
-
-    def _phylonet_to_intermediate(m: re.Match) -> str:
-        """Rewrite one ``#H:len::gamma`` match as ``#H[&gamma=g]:len``."""
-        name = m.group(1)
-        branch = m.group(2) or ''
-        gamma = m.group(3)
-        # PhyNetPy order: name [&gamma=X] :branch
-        return name + '[&gamma=' + gamma + ']' + branch
-
-    s = re.sub(phylonet_pattern, _phylonet_to_intermediate, s)
-
-    # Now the string is fully in PhyNetPy [&gamma=X] form.
-
-    # ---- Step 3: Convert to target standard ----
-    if standard == "PhyNetPy":
-        return s
-
-    elif standard == "Phylonet":
-        # Convert [&...gamma=X...] on reticulation nodes to ::X
-        # Also strips gamma from compound metadata blocks, leaving
-        # other metadata intact.
-        retic_metadata_pattern = (
-            r'(#[A-Za-z_]\w*)'                # Group 1: retic name
-            r'\[&([^\]]+)\]'                   # Group 2: metadata body
-            r'(:' + _NUM_RE + r')?'            # Group 3: optional :branch
-        )
-
-        def _to_phylonet(m: re.Match) -> str:
-            """Move a ``gamma=`` entry out of a metadata block into ``::gamma``."""
-            name = m.group(1)
-            metadata = m.group(2)
-            branch = m.group(3) or ''
-
-            # Extract gamma value from metadata
-            gamma_match = re.search(
-                r'gamma=(' + _NUM_RE + r')', metadata
-            )
-            if not gamma_match:
-                # No gamma found; leave this node untouched
-                return m.group(0)
-
-            gamma_val = gamma_match.group(1)
-
-            # Remove gamma entry from metadata
-            # Handle both "gamma=X,other" and "other,gamma=X" orderings
-            remaining = re.sub(
-                r',?\s*gamma=' + _NUM_RE, '', metadata
-            )
-            remaining = remaining.strip(',').strip()
-
-            result = name
-            if remaining:
-                result += '[&' + remaining + ']'
-            # PhyloNet order: name :branch ::gamma
-            result += branch + '::' + gamma_val
-            return result
-
-        s = re.sub(retic_metadata_pattern, _to_phylonet, s)
-        return s
-
-    elif standard == "Beast":
-        # Add [&R] prefix for rooted tree annotation
-        return "[&R] " + s
-
-    # Should never reach here due to validation above
-    return s
-
+    return _core.io_convert_newick(newick_str, standard)

@@ -1,0 +1,22 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+*.so
+
+# Rust
+/target/
+Cargo.lock.bak
+
+# Outputs
+runs/
+reports/
+example_output.nex
+tests/crosscheck/*.class

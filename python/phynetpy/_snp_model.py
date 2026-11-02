@@ -31,6 +31,12 @@ search loop mutates.
 This representation exists only for the Bryant et al. biallelic algorithm,
 whose per-node math differs between leaves, internal nodes, reticulations, and
 the root. No other inference method in PhyNetPy uses it.
+
+The compiled likelihood kernel (``phynetpy._core._snp_log_likelihood_core``)
+builds the same typed view straight from the network -- nodes in ``V()``
+order classified by degree, children in ``E()`` order, parent branches in
+in-edge order -- so this Python graph is what the resource estimates, the
+leaf/sample binding and the GPU strategy path walk.
 """
 
 from __future__ import annotations

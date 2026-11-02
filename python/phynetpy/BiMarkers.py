@@ -28,9 +28,12 @@ It provides:
 * :func:`_snp_mcmc` -- a Metropolis-Hastings search driver wired to that
   likelihood; the core of the ``(BiallelicMarkers, MSC, Bayesian)`` cell.
 * :class:`SNPScorer` -- the ``Callable[[Model], float]`` adapter both use.
-* A NumPy implementation that offloads the site loop to the GPU via
-  ``cupy`` when both the hardware and that package are present, and runs
-  on the CPU otherwise.
+* The numerical core -- the ``(n, r)`` rate matrix and its exponential,
+  the root prior, the sparse merge/split tables, the rescaled tensor rules
+  and the bottom-up DP over the network -- runs in the compiled extension
+  ``phynetpy._core`` (``src/kernels/snp.rs``).  The optional CuPy path
+  offloads the site loop to the GPU when both the hardware and that
+  package are present.
 
 Docs   - [x]
 Tests  - [x]
@@ -55,15 +58,12 @@ from __future__ import annotations
 ##
 ##############################################################################
 
-import copy
 import math
 from collections import deque
 from functools import lru_cache
-from math import comb
 import time
 from typing import TYPE_CHECKING, Optional
 import numpy as np
-from scipy.linalg import expm, null_space
 from dataclasses import dataclass
 
 # CuPy import - with graceful fallback to the pure NumPy CPU path.
@@ -166,6 +166,19 @@ from ._snp_model import (
     postorder,
 )
 from .GraphUtils import level as network_level, network_clusters
+from ._core import (
+    BiMarkersTransition,
+    _snp_equalize_scales,
+    _snp_log_likelihood_core,
+    _snp_rescale,
+    _snp_rescale_global,
+    _snp_root_stationary,
+    _snp_rule2,
+    _snp_rule3,
+    _snp_rule4,
+    _snp_sparse_merge,
+    _snp_sparse_split,
+)
 
 if TYPE_CHECKING:
     # Imported lazily at call sites to keep the MCMC stack out of the
@@ -282,20 +295,12 @@ def _root_stationary(Q: np.ndarray, m: int) -> np.ndarray:
         A length ``state_dim(m)`` vector ``pi`` with ``pi[(0, 0)] = 0`` and
         ``pi[(n, r)]`` giving the root-population probability of ``(n, r)``.
     """
-    d = state_dim(m)
-    # Restrict to the n >= 1 block: index 0 is the absorbing empty state, which
-    # contributes an extra (spurious) null vector and never occurs at the root.
-    q_sub = Q[1:d, 1:d]
-    ns = null_space(q_sub)
-    if ns.shape[1] == 0:
-        raise ValueError("Biallelic rate matrix has no stationary distribution")
-    x = ns[:, 0]
-    # Normalise so the single-lineage block (indices for (1,0) and (1,1),
-    # i.e. the first two entries of the n >= 1 block) sums to 1.
-    x = x / (x[0] + x[1])
-    pi = np.zeros(d)
-    pi[1:d] = x
-    return pi
+    # Solved in the compiled core: the null vector of the n >= 1 block
+    # (index 0 is the absorbing empty state, which contributes a spurious
+    # extra null vector and never occurs at the root) by exact block
+    # back-substitution over the block-lower-triangular Q, with an SVD null
+    # space as fallback, normalised so the single-lineage block sums to 1.
+    return _snp_root_stationary(np.ascontiguousarray(Q, dtype=np.float64), m)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SPARSE COEFFICIENT REPRESENTATIONS
@@ -357,29 +362,12 @@ def build_sparse_merge(mx: int, my: int) -> SparseMerge:
     Returns:
         SparseMerge with coordinate arrays.
     """
-    i_list, j_list, k_list, c_list = [], [], [], []
-    
-    for nx in range(0, mx + 1):
-        for rx in range(nx + 1):
-            i = nr_to_index(nx, rx)
-            for ny in range(0, my + 1):
-                for ry in range(ny + 1):
-                    j = nr_to_index(ny, ry)
-                    nz = nx + ny
-                    rz = rx + ry
-                    k = nr_to_index(nz, rz)
-                    coeff = comb(rz, rx) * comb(nz - rz, nx - rx) / comb(nz, nx)
-                    
-                    i_list.append(i)
-                    j_list.append(j)
-                    k_list.append(k)
-                    c_list.append(coeff)
-    
+    i_arr, j_arr, k_arr, coeff_arr = _snp_sparse_merge(mx, my)
     return SparseMerge(
-        i_arr=np.array(i_list, dtype=np.int32),
-        j_arr=np.array(j_list, dtype=np.int32),
-        k_arr=np.array(k_list, dtype=np.int32),
-        coeff_arr=np.array(c_list, dtype=np.float64),
+        i_arr=i_arr,
+        j_arr=j_arr,
+        k_arr=k_arr,
+        coeff_arr=coeff_arr,
         dim_x=state_dim(mx),
         dim_y=state_dim(my),
         dim_z=state_dim(mx + my),
@@ -413,31 +401,12 @@ def build_sparse_split(m: int, gamma: float) -> SparseSplit:
     Returns:
         SparseSplit with coordinate arrays.
     """
-    i_list, j_list, k_list, c_list = [], [], [], []
-    
-    for n in range(0, m + 1):
-        for r in range(n + 1):
-            i = nr_to_index(n, r)
-            for nb in range(0, n + 1):
-                nd = n - nb
-                for rb in range(max(0, r - nd), min(r, nb) + 1):
-                    rd = r - rb
-                    
-                    j = nr_to_index(nb, rb)
-                    k = nr_to_index(nd, rd)
-                    coeff = (comb(n, nb)
-                             * (gamma ** nb) * ((1 - gamma) ** nd))
-                    
-                    i_list.append(i)
-                    j_list.append(j)
-                    k_list.append(k)
-                    c_list.append(coeff)
-    
+    i_arr, j_arr, k_arr, coeff_arr = _snp_sparse_split(m, gamma)
     return SparseSplit(
-        i_arr=np.array(i_list, dtype=np.int32),
-        j_arr=np.array(j_list, dtype=np.int32),
-        k_arr=np.array(k_list, dtype=np.int32),
-        coeff_arr=np.array(c_list, dtype=np.float64),
+        i_arr=i_arr,
+        j_arr=j_arr,
+        k_arr=k_arr,
+        coeff_arr=coeff_arr,
         dim=state_dim(m),
         m=m,
     )
@@ -1172,52 +1141,83 @@ def _snp_log_likelihood(net: Network,
     )
     q = _get_transition(max_n, u, v, root_theta)
 
-    for leaf in snp_model.nodetypes["leaf"]:
+    leaves = snp_model.nodetypes["leaf"]
+    for leaf in leaves:
         assert(type(leaf) is LeafNode)
         leaf.samples = samples[leaf.get_name()]
 
-    def _run_batch(site_slice: tuple[int, int] | None) -> float:
-        """Run one site batch and return its log-likelihood contribution."""
-        strategy = SNPStrategy(q, u, v, theta, n_sites, max_n,
-                               site_slice=site_slice,
-                               use_gpu=use_gpu,
-                               branch_thetas=branch_thetas)
-        visitor = SNPModelVisitor(strategy)
-        try:
-            for node in postorder(snp_model.root):
-                visitor.visit(node)
-            return strategy.L
-        except Exception as exc:
-            if (
-                use_gpu
-                and cp is not None
-                and isinstance(exc, cp.cuda.memory.OutOfMemoryError)
-            ):
-                raise SNPResourceError(
-                    "GPU memory was exhausted while evaluating a marker "
-                    f"batch of {n_sites if site_slice is None else site_slice[1] - site_slice[0]} "
-                    "sites. Reduce the site batch or use hardware with more "
-                    "free VRAM."
-                ) from exc
-            raise
-        finally:
-            # Model nodes and strategy caches otherwise retain every batch's
-            # device tensors until the full likelihood call returns. Release
-            # those references before asking CuPy to return unused blocks.
-            visitor.vpis.clear()
-            strategy.cache.clear()
-            for nodes in snp_model.nodetypes.values():
-                for node in nodes:
-                    node.vpi = None
-            if use_gpu and cp is not None:
-                try:
-                    cp.cuda.Stream.null.synchronize()
-                    cp.get_default_memory_pool().free_all_blocks()
-                    cp.get_default_pinned_memory_pool().free_all_blocks()
-                except Exception:
-                    # A CUDA OOM can leave cleanup calls failing too; preserve
-                    # the actionable SNPResourceError raised above.
-                    pass
+    if use_gpu:
+        def _run_batch(site_slice: tuple[int, int] | None) -> float:
+            """Run one site batch on the GPU and return its log-likelihood."""
+            strategy = SNPStrategy(q, u, v, theta, n_sites, max_n,
+                                   site_slice=site_slice,
+                                   use_gpu=True,
+                                   branch_thetas=branch_thetas)
+            visitor = SNPModelVisitor(strategy)
+            try:
+                for node in postorder(snp_model.root):
+                    visitor.visit(node)
+                return strategy.L
+            except Exception as exc:
+                if (
+                    cp is not None
+                    and isinstance(exc, cp.cuda.memory.OutOfMemoryError)
+                ):
+                    raise SNPResourceError(
+                        "GPU memory was exhausted while evaluating a marker "
+                        f"batch of {n_sites if site_slice is None else site_slice[1] - site_slice[0]} "
+                        "sites. Reduce the site batch or use hardware with more "
+                        "free VRAM."
+                    ) from exc
+                raise
+            finally:
+                # Model nodes and strategy caches otherwise retain every
+                # batch's device tensors until the full likelihood call
+                # returns. Release those references before asking CuPy to
+                # return unused blocks.
+                visitor.vpis.clear()
+                strategy.cache.clear()
+                for nodes in snp_model.nodetypes.values():
+                    for node in nodes:
+                        node.vpi = None
+                if cp is not None:
+                    try:
+                        cp.cuda.Stream.null.synchronize()
+                        cp.get_default_memory_pool().free_all_blocks()
+                        cp.get_default_pinned_memory_pool().free_all_blocks()
+                    except Exception:
+                        # A CUDA OOM can leave cleanup calls failing too;
+                        # preserve the actionable SNPResourceError raised
+                        # above.
+                        pass
+    else:
+        # CPU: the whole DP runs in the compiled core, which reads the
+        # network directly.  Leaf data and per-branch thetas are resolved
+        # here once per call, exactly as the strategy resolves them per
+        # branch.
+        leaf_reds: dict[str, list[int]] = {}
+        leaf_samples: dict[str, int] = {}
+        for leaf in leaves:
+            assert len(leaf.data) == 1, \
+                "Leaf node must have exactly one data sequence"
+            leaf_reds[leaf.get_name()] = leaf.data[0].get_numerical_seq()
+            leaf_samples[leaf.get_name()] = leaf.samples
+        edge_thetas = None
+        if branch_thetas:
+            edge_thetas = {}
+            for edge in net.E():
+                child_label = edge.dest.label
+                parent_label = edge.src.label
+                edge_thetas[(child_label, parent_label)] = resolve_branch_theta(
+                    theta, branch_thetas, child_label, parent=parent_label,
+                )
+
+        def _run_batch(site_slice: tuple[int, int] | None) -> float:
+            """Run one site batch and return its log-likelihood contribution."""
+            return _snp_log_likelihood_core(
+                net, leaf_reds, leaf_samples, n_sites, u, v, theta,
+                root_theta, site_slice=site_slice, edge_thetas=edge_thetas,
+            )
 
     # ── Execute ─────────────────────────────────────────────────────────
     start_t = time.perf_counter()
@@ -1265,163 +1265,13 @@ def _get_transition(n: int, u: float, v: float, theta: float) -> "BiMarkersTrans
     return BiMarkersTransition(n, u, v, theta)
 
 
-class BiMarkersTransition:
-    """
-    Class that encodes the probabilities of transitioning from one (n,r) pair 
-    to another under a Biallelic model.
+# ``BiMarkersTransition`` (the Bryant eq. 15 rate matrix over the ``(n, r)``
+# states, including the empty state ``(0, 0)`` at index 0, and ``expt(t)``)
+# is the compiled class imported from ``phynetpy._core`` above.  ``e^{Qt}``
+# is evaluated by scaling-and-squaring Padé (the ``scipy.linalg.expm``
+# algorithm) and cached per ``(n, u, v, theta, t)``, so repeated branch
+# lengths along an MCMC chain cost nothing after the first evaluation.
 
-    Includes method for efficiently computing e^Qt
-
-    Inputs:
-    1) n-- the total number of samples in the species tree
-    2) u-- the probability of going from the red allele to the green one
-    3) v-- the probability of going from the green allele to the red one
-    4) theta-- population mutation rate ``4*N*mu``
-
-    Assumption: Matrix indexes start with n=1, r=0, so Q[0][0] is Q(1,0);(1,0)
-
-    Q Matrix is given by Equation 15 from:
-
-    David Bryant, Remco Bouckaert, Joseph Felsenstein, Noah A. Rosenberg, 
-    Arindam RoyChoudhury, Inferring Species Trees Directly from Biallelic 
-    Genetic Markers: Bypassing Gene Trees in a Full Coalescent Analysis, 
-    Molecular Biology and Evolution, Volume 29, Issue 8, August 2012, 
-    Pages 1917–1932, https://doi.org/10.1093/molbev/mss086
-    """
-
-    def __init__(self, n : int, u : float, v : float, theta : float) -> None:
-        """
-        Initialize the Q matrix
-
-        Args:
-            n (int): sample count
-            u (float): Mutation rate from red to green.
-            v (float): Mutation rate from green to red.
-            theta (float): Population mutation rate ``4*N*mu``.
-        Returns:
-            N/A
-        """
-
-        # Build Q matrix
-        self.n = n 
-        self.u = u
-        self.v = v
-        self.theta = theta
-
-        # Lazily-built spectral decomposition Q = V diag(w) V^{-1}, used to
-        # evaluate e^{Qt} for arbitrary t as V diag(e^{wt}) V^{-1} in two
-        # matmuls instead of a fresh scaling-and-squaring Padé approximation
-        # per branch.  ``None`` until the first :meth:`expt` call; set to
-        # ``False`` if the decomposition is rejected as numerically unsafe
-        # (then :meth:`expt` falls back to :func:`scipy.linalg.expm`).
-        self._eig = None
-
-        # State space includes the empty state (0, 0) at index 0, which is
-        # absorbing (no lineages -> no mutation, no coalescence).  We never
-        # iterate it below, so its Q row/column stay zero and ``expm`` maps it
-        # to itself with probability 1 -- an empty branch stays empty.
-        rows = state_dim(self.n)
-        self.Q : np.ndarray = np.zeros((rows, rows))
-        
-        # n ranges from 1 to individuals sampled (both inclusive)
-        for n_prime in range(1, self.n + 1):  
-            # r ranges from 0 to n (both inclusive)
-            for r_prime in range(n_prime + 1):  
-                
-                # get indeces from n,r pair 
-                n_r = nr_to_index(n_prime, r_prime)
-                nm_rm = nr_to_index(n_prime - 1, r_prime - 1)
-                n_rm = nr_to_index(n_prime, r_prime - 1)
-                nm_r = nr_to_index(n_prime - 1, r_prime)
-                n_rp = nr_to_index(n_prime, r_prime + 1)
-                
-
-                #### EQ 15 ####
-                
-                # THE DIAGONAL. always calculated
-                self.Q[n_r][n_r] = - (n_prime * (n_prime - 1) / theta) \
-                                       - (v * (n_prime - r_prime)) \
-                                       - (r_prime * u)
-
-                # These equations only make sense if r isn't 0 
-                # (and the second, if n isn't 1).
-                if 0 < r_prime <= n_prime:
-                    if n_prime > 1:
-                        self.Q[n_r][nm_rm] = (r_prime - 1) * n_prime / theta
-                    self.Q[n_r][n_rm] = (n_prime - r_prime + 1) * v
-
-                # These equations only make sense if r is strictly less than n 
-                # (and the second, if n is not 1).
-                if 0 <= r_prime < n_prime:
-                    if n_prime > 1:
-                        self.Q[n_r][nm_r] = (n_prime - 1 - r_prime) \
-                                            * n_prime / theta
-                    self.Q[n_r][n_rp] = (r_prime + 1) * u
-
-    def _build_eig(self) -> None:
-        """Diagonalise ``Q`` once and validate against a Padé reference.
-
-        The biallelic rate matrix is diagonalisable with a well-conditioned
-        eigenbasis (condition number grows only polynomially with the state
-        dimension), so ``e^{Qt}`` can be reconstructed to ~1e-12 accuracy.
-        We verify this on a spread of representative ``t`` values against
-        :func:`scipy.linalg.expm`; if the round-trip error is ever too large
-        (a degenerate / defective ``Q``), we mark the decomposition unusable
-        and permanently fall back to the exact Padé path.
-        """
-        try:
-            w, V = np.linalg.eig(self.Q)
-            Vinv = np.linalg.inv(V)
-        except np.linalg.LinAlgError:
-            self._eig = False
-            return
-        # Validate: max abs error vs expm across representative branch times.
-        for t in (0.001, 0.01, 0.1, 1.0, 5.0):
-            approx = np.real((V * np.exp(w * t)) @ Vinv)
-            if not np.allclose(approx, expm(self.Q * t), atol=1e-9, rtol=1e-7):
-                self._eig = False
-                return
-        self._eig = (w, V, Vinv)
-
-    def expt(self, t : float = 1) -> np.ndarray:
-        """
-        Compute e^(Q*t) efficiently.
-        
-        Args:
-            t (float): time, generally in coalescent units. Optional, defaults 
-                       to 1, in which case e^Q is computed.
-        
-        Returns:
-            np.ndarray: e^(Q*t).
-        """
-        if self._eig is None:
-            self._build_eig()
-        if self._eig is False:
-            return expm(self.Q * t)
-        w, V, Vinv = self._eig
-        return np.real((V * np.exp(w * t)) @ Vinv)
-
-    def cols(self) -> int:
-        """
-        return the dimension of the Q matrix
-        
-        Args:
-            N/A
-        Returns:
-            int: the number of columns in the Q matrix
-        """
-        return self.Q.shape[1]
-
-    def getQ(self) -> np.ndarray:
-        """
-        Retrieve the Q matrix.
-
-        Args:
-            N/A
-        Returns:
-            np.ndarray: The Q matrix.
-        """
-        return self.Q
 
 class SNPStrategy:
     """
@@ -1519,6 +1369,11 @@ class SNPStrategy:
         
         Works on both CPU (NumPy) and GPU (CuPy) via self.xp.
         """
+        if not self.use_gpu:
+            return _snp_rescale(
+                np.asarray(F, dtype=np.float64),
+                np.asarray(log_scale, dtype=np.float64),
+            )
         xp = self.xp
         # Per-vector max: max over the LAST axis only
         max_val = xp.max(xp.abs(F), axis=-1, keepdims=True)  # shape (..., 1)
@@ -1548,6 +1403,11 @@ class SNPStrategy:
         The log_scale must be per-site (1-D) for this method.
         Works on both CPU (NumPy) and GPU (CuPy) via self.xp.
         """
+        if not self.use_gpu:
+            return _snp_rescale_global(
+                np.asarray(F, dtype=np.float64),
+                np.asarray(log_scale, dtype=np.float64),
+            )
         xp = self.xp
         reduce_axes = tuple(range(1, F.ndim))
         max_val = xp.max(xp.abs(F), axis=reduce_axes)  # shape (S,)
@@ -1575,6 +1435,11 @@ class SNPStrategy:
         
         Works on both CPU (NumPy) and GPU (CuPy) via self.xp.
         """
+        if not self.use_gpu:
+            return _snp_equalize_scales(
+                np.asarray(F, dtype=np.float64),
+                np.asarray(log_scale, dtype=np.float64),
+            )
         xp = self.xp
         if log_scale.ndim <= 1:
             # Already per-site scalar — nothing to equalize
@@ -1638,6 +1503,12 @@ class SNPStrategy:
         The nnz dimension is processed in chunks to prevent GPU/CPU OOM
         from the broadcast intermediate (S, *x_extra, *y_extra, nnz).
         """
+        if not self.use_gpu:
+            return _snp_rule2(
+                np.asarray(F_x, dtype=np.float64),
+                np.asarray(F_y, dtype=np.float64),
+                m_x, m_y,
+            )
         xp = self.xp
         sm = self._get_sm(m_x, m_y)
         nnz = len(sm.i_arr)
@@ -1711,6 +1582,8 @@ class SNPStrategy:
         
         GPU-compatible via self.xp and self._scatter_add.
         """
+        if not self.use_gpu:
+            return _snp_rule3(np.asarray(F, dtype=np.float64), mx, gammax)
         xp = self.xp
         ss = self._get_ss(mx, gammax)
         
@@ -1740,6 +1613,8 @@ class SNPStrategy:
         
         GPU-compatible via self.xp and self._scatter_add.
         """
+        if not self.use_gpu:
+            return _snp_rule4(np.asarray(F, dtype=np.float64), mx, my)
         xp = self.xp
         sm = self._get_sm(mx, my)
         
@@ -1811,7 +1686,12 @@ class SNPStrategy:
         if cached is not None:
             return cached
         
-        rule2 = _disjoint_subnets(n)
+        # Two interfaces of the same partial merge by rule 4; two different
+        # partials (disjoint sub-networks) by rule 2.  Identity is the right
+        # test: crossing reticulations can leave both children's interfaces
+        # in one partial even though their subnets are disjoint, and rule 2
+        # would then outer-product that partial with itself.
+        rule2 = x is not y
         
         if rule2:
             mx = x.max_lineages[-1]
@@ -1925,7 +1805,12 @@ class SNPStrategy:
         if cached is not None:
             return cached
         
-        rule2 = _disjoint_subnets(n)
+        # Two interfaces of the same partial merge by rule 4; two different
+        # partials (disjoint sub-networks) by rule 2.  Identity is the right
+        # test: crossing reticulations can leave both children's interfaces
+        # in one partial even though their subnets are disjoint, and rule 2
+        # would then outer-product that partial with itself.
+        rule2 = x is not y
         
         if rule2:
             # Equalize both VPIs to per-site scales before merge

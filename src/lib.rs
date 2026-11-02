@@ -6,8 +6,10 @@
 
 use pyo3::prelude::*;
 
+pub mod dimple;
 pub mod graph;
 pub mod io;
+pub mod metrics;
 pub mod kernels;
 pub mod search;
 pub mod sim;
@@ -39,5 +41,12 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     io::register(m)?;
     search::moves::register(m)?;
     sim::birthdeath::register(m)?;
+    sim::seq::register(m)?;
+    sim::snp::register(m)?;
+    graph::genetrees::register(m)?;
+    metrics::register(m)?;
+    dimple::register(m)?;
+    search::mcmc_seq::register(m)?;
+    search::mcmc_gt::register(m)?;
     Ok(())
 }

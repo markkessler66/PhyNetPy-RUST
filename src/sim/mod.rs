@@ -2,3 +2,5 @@
 //! sequence and marker simulation.
 
 pub mod birthdeath;
+pub mod seq;
+pub mod snp;

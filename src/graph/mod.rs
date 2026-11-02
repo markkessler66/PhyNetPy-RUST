@@ -10,6 +10,7 @@ pub mod newick;
 pub mod node;
 pub mod sets;
 pub mod utils;
+pub mod genetrees;
 
 pub use branch::Branch;
 pub use edge::Edge;

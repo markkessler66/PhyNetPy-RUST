@@ -10,9 +10,13 @@ contract for every module port.
 | Path | Role |
 | --- | --- |
 | `python/phynetpy/` | The public package. Each ported module becomes a *facade*: same module name, same public and test-visible names, docstrings kept, implementation imported from `phynetpy._core`. |
-| `src/lib.rs` | Module root. Every submodule is registered here already through a `register(m)` function. **Do not edit `lib.rs`, `src/kernels/mod.rs`, `src/graph/mod.rs` or `Cargo.toml`.** If you need a new crate dependency, say so in your report instead. |
-| `src/graph/` | `Node`, `Edge`, `Network` (`network.rs`), graph algorithms (`algorithms.rs`), Newick (`newick.rs`), stub `utils.rs` for GraphUtils. |
-| `src/kernels/` | `common.rs` (LOG_FLOOR, logaddexp, logsumexp, gij), `mask.rs` (lineage bitmasks), `msnc.rs` (coalescent DPs, a finished example), stubs `mpl.rs`, `seq.rs`, `snp.rs`. |
+| `src/lib.rs` | Module root. Every submodule is registered here already through a `register(m)` function. **Do not edit `lib.rs`, any `mod.rs`, or `Cargo.toml`.** If you need a new crate dependency, say so in your report instead. |
+| `src/graph/` | `Node`, `Edge`, `Network` (`network.rs`), graph algorithms (`algorithms.rs`), Newick (`newick.rs`), `utils.rs` (GraphUtils). |
+| `src/kernels/` | `common.rs` (LOG_FLOOR, logaddexp, logsumexp, gij), `mask.rs` (lineage bitmasks), `msnc.rs` (coalescent DPs), `mpl.rs` (MPL triplets), `seq.rs` (sequence likelihood, GTR), `snp.rs` (biallelic markers), `allop.rs` (MP-allop), `chain.rs` (chain diagnostics), `optimize.rs` (Brent). |
+| `src/io.rs` | Newick / NEXUS / FASTA / VCF readers and writers behind `IO.py`. |
+| `src/search/` | `moves.rs` (network proposal moves). Placeholders `mcmc_seq.rs`, `mcmc_gt.rs`. |
+| `src/sim/` | `birthdeath.rs` (Yule, CBDP). Placeholders `seq.rs`, `snp.rs`. |
+| `src/graph/genetrees.rs`, `src/metrics.rs`, `src/dimple.rs` | Placeholders for the GeneTrees analysis, network metric, and DIMPLE ports. |
 | `src/util.rs` | `warn(py, msg)`, `network_error(py, msg)` and friends (they raise the Python-defined exception classes), `py_float_repr`, `deepcopy`, `type_name`, `coerce_unit`. |
 | `tests/` | The upstream suite, copied verbatim. It is the contract: `python -m pytest -m "not slow"` must stay at 1349 passed / 24 skipped. |
 

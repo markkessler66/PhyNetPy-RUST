@@ -1581,6 +1581,7 @@ impl Network {
     fn __getstate__<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyDict>> {
         let py = slf.py();
         let this = slf.borrow();
+        let _ = py;
         let d = PyDict::new(py);
         let index: FxHashMap<u64, usize> = this.nodes.keys().enumerate().map(|(i, u)| (*u, i)).collect();
         d.set_item("nodes", this.node_list(py, this.nodes.keys().copied())?)?;
@@ -1597,7 +1598,6 @@ impl Network {
     }
 
     fn __setstate__(slf: &Bound<'_, Self>, state: Bound<'_, PyDict>) -> PyResult<()> {
-        let py = slf.py();
         let nodes: Vec<Bound<'_, Node>> = state
             .get_item("nodes")?
             .map(|v| v.extract())

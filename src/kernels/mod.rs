@@ -1,5 +1,7 @@
 //! Numerical kernels: coalescent DPs, likelihoods, substitution models.
 
+pub mod allop;
+pub mod chain;
 pub mod common;
 pub mod mask;
 pub mod mpl;

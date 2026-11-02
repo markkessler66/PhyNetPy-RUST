@@ -7,7 +7,9 @@
 use pyo3::prelude::*;
 
 pub mod graph;
+pub mod io;
 pub mod kernels;
+pub mod search;
 pub mod util;
 
 #[pymodule]
@@ -30,5 +32,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     kernels::seq::register(m)?;
     kernels::snp::register(m)?;
     graph::utils::register(m)?;
+    kernels::allop::register(m)?;
+    kernels::chain::register(m)?;
+    io::register(m)?;
+    search::moves::register(m)?;
     Ok(())
 }

@@ -143,16 +143,12 @@ from ._search_flags import (
 # that it single-handedly dominates the score.
 _LOG_FLOOR = math.log(1e-200)
 
-# Cython backend detection.  The ``.so`` must be built for the
-# interpreter's ABI; see README for the one-liner
-# ``python setup.py build_ext --inplace``.  When the import fails,
-# the pure-Python DP path in ``_TripleDPEngine`` is used instead -- both
-# paths compute the same score.
-try:
-    from .cython.mpl_engine_cy import score_all_triplets as _cy_score
-    _HAS_CYTHON_MPL = True
-except ImportError:
-    _HAS_CYTHON_MPL = False
+# Compiled backend.  The triplet DP and the rho precomputation run in the
+# Rust core (``phynetpy._core``); ``_HAS_CYTHON_MPL`` keeps its historical
+# name for callers that consulted it, and is always True.
+from ._core import _MplTopology, _TripletIndex, _compute_rhos
+
+_HAS_CYTHON_MPL = True
 
 
 # ======================================================================
@@ -608,78 +604,27 @@ def _compute_all_rhos_fast(
 ) -> dict[tuple[str, str, str], tuple[float, float, float]]:
     """Compute the full rho table in one pass over ``gene_trees``.
 
-    Flips the naive "triplet outer, tree inner" loop to "tree outer,
-    triplet inner".  Each gene tree is indexed exactly once and the
-    index is reused for all triplets -- a large win when the triplet
-    count (cubic in species count) dominates the tree count.
-
-    When ``n_workers > 1`` the tree list is split into batches and
-    processed with ``ProcessPoolExecutor``; partial rho counts are
-    summed across workers.
+    Each gene tree is indexed exactly once (pairwise LCA depths of the
+    relevant leaves) and the index is reused for all triplets -- a large
+    win when the triplet count (cubic in species count) dominates the
+    tree count.  The work runs in the compiled core; ``n_workers > 1``
+    splits the trees across native threads.
 
     Args:
         gene_trees: Collection of gene trees.
         mapping: Species -> list of allele labels.
         triplets: Canonical species triplets.
-        n_workers: Worker-process count for the parallel path.  Set
-            to 1 (default) for the single-process path, which is
-            preferred for small datasets where process-spawn overhead
-            dwarfs the compute.
+        n_workers: Thread count for the parallel path.  ``1`` (default)
+            runs single-threaded.
 
     Returns:
         ``dict`` mapping each triplet to a tuple
         ``(rho_XY|Z, rho_XZ|Y, rho_YZ|X)``.
     """
-    # Universe of allele labels that will ever be queried.  Leaves
-    # outside this set are skipped by the LCA index constructor.
-    relevant = frozenset(a for alleles in mapping.values() for a in alleles)
-
-    # Detect the common "one allele per species" case so the inner
-    # loop can skip the allele-product expansion entirely.
-    identity_mapping = all(len(v) == 1 for v in mapping.values())
-
-    trees = gene_trees.trees
-
-    # Single-process fast path.  Preferred for small datasets where
-    # process-spawn overhead dwarfs the compute.
-    if n_workers <= 1 or len(trees) < 4:
-        merged = _process_tree_batch(
-            trees, relevant, mapping, triplets, identity_mapping
-        )
-        return {t: tuple(merged[t]) for t in triplets}
-
-    # Parallel path: split trees into roughly equal batches, fan out.
-    from concurrent.futures import ProcessPoolExecutor
-    batch_size = max(1, (len(trees) + n_workers - 1) // n_workers)
-    batches = [
-        trees[i : i + batch_size]
-        for i in range(0, len(trees), batch_size)
-    ]
-
-    futures = []
-    with ProcessPoolExecutor(max_workers=n_workers) as executor:
-        for batch in batches:
-            futures.append(
-                executor.submit(
-                    _process_tree_batch,
-                    batch, relevant, mapping, triplets, identity_mapping,
-                )
-            )
-
-    # Merge partial rho counts from each worker.
-    merged: dict[tuple[str, str, str], list[float]] = {
-        t: [0.0, 0.0, 0.0] for t in triplets
-    }
-    for fut in futures:
-        partial = fut.result()
-        for t in triplets:
-            p = partial[t]
-            m = merged[t]
-            m[0] += p[0]
-            m[1] += p[1]
-            m[2] += p[2]
-
-    return {t: tuple(merged[t]) for t in triplets}
+    pairs = [(str(sp), [str(a) for a in alleles]) for sp, alleles in mapping.items()]
+    trips = [tuple(t) for t in triplets]
+    rho = _compute_rhos(list(gene_trees.trees), pairs, trips, int(n_workers))
+    return {t: tuple(r) for t, r in zip(triplets, rho)}
 
 
 # ======================================================================
@@ -688,16 +633,8 @@ def _compute_all_rhos_fast(
 # Computes P(resolution | Psi, gamma) for a single rooted triplet
 # against a fixed species network Psi.  The algorithm mirrors
 # PhyloNet's pseudo-likelihood code path, which itself follows Yu &
-# Nakhleh (2015).
-#
-# State-space encoding:
-#   Each DP state is a small integer 0..10 representing which of the
-#   three triplet lineages are present at a node and how they have
-#   coalesced so far.  The three transition maps below
-#   (_MERGING_MAP / _SPLITTING_MAP / _COALESCING_MAP) encode the
-#   combinatorics of lineage merges (tree-node children join up),
-#   lineage splits (reticulation node sends each lineage up one of
-#   two parent edges), and within-branch coalescent transitions.
+# Nakhleh (2015).  The DP itself lives in the compiled core
+# (``phynetpy._core._MplTopology``); this class is the Python handle.
 #
 # State legend (triplet lineages labelled 1, 2, 3):
 #    0  nothing                             1  lineage 1 only
@@ -708,31 +645,28 @@ def _compute_all_rhos_fast(
 #              coalesced; differ in how many common ancestors are still
 #              distinct.  State 10 (single lineage from triplet) is a
 #              terminal articulation state.
-#
-# Each _Configuration additionally tracks the sequence of
-# reticulation-parent choices made so far (indexed by
-# reticulation-node id).  Two configurations are "compatible" iff
-# they never disagree on any retic-node choice, which is how
-# independent lineages avoid double-counting reticulation decisions.
 # ======================================================================
 
 class _TripleDPEngine:
     """Dynamic-programming engine for 3-taxon triplet probabilities.
 
     Each instance is bound to one fixed species network ``Psi``.
-    Construction caches topology info (adjacency, articulation nodes,
-    branch lengths, inheritance probabilities) so the per-triplet DP
-    never has to touch :class:`Network` methods again.
+    Construction extracts the topology (leaf-to-root order, adjacency,
+    articulation nodes, branch lengths and inheritance probabilities)
+    into the compiled engine, so the per-triplet DP never touches
+    :class:`Network` again.
 
-    The engine is called thousands of times during a search (once per
-    triplet resolution per score evaluation), so all hot-path data
-    structures are kept as plain ``dict`` s keyed by :class:`Node`.
+    Attributes:
+        network: The bound species network.
+        net_node_num: Number of reticulation nodes.
+        articulation_nodes: Tree nodes whose removal disconnects leaves
+            from the root (plus leaves and the root).
+        lowest_articulation_nodes: Articulation nodes at which the DP
+            collapses compatible configurations.
     """
 
-    # Tree-node merge rules.  When a tree node has two children whose
-    # DP subtrees currently carry states s1 and s2 (with s1 < s2),
-    # (s1, s2) -> target_state gives the merged state.  The state
-    # names above describe which lineages each bit pattern encodes.
+    # The transition tables, kept for reference; the compiled DP holds
+    # its own copies.
     _MERGING_MAP = {
         (1, 2): 4,
         (1, 3): 5,
@@ -742,12 +676,6 @@ class _TripleDPEngine:
         (3, 4): 7,
         (3, 8): 9,
     }
-
-    # Reticulation-node split rules.  When a reticulation is processed
-    # (moving from child toward parents), the current state splits
-    # into two sub-states, one for each parent edge.  The list of
-    # (split1, split2) pairs enumerates all ways the lineages can be
-    # partitioned between the two parents.
     _SPLITTING_MAP = {
         0: [(0, 0)],
         1: [(0, 1)],
@@ -761,14 +689,6 @@ class _TripleDPEngine:
         9: [(0, 9), (3, 8)],
         10: [(0, 10)],
     }
-
-    # Within-branch coalescent rules.  ``target_state ->
-    # [(source_state, (lineages_in, lineages_out))]`` lists every way
-    # ``source_state`` can transition to ``target_state`` on a single
-    # branch, paired with the number of ancestral lineages entering
-    # the branch (``lineages_in``) and the number leaving it
-    # (``lineages_out``).  The coalescent probability per branch is
-    # computed by ``_gij`` using (length, lineages_in, lineages_out).
     _COALESCING_MAP = {
         0: [(0, (0, 0))],
         1: [(1, (1, 1))],
@@ -783,132 +703,8 @@ class _TripleDPEngine:
         10: [(10, (1, 1))],
     }
 
-    class _Configuration:
-        """One DP configuration: total probability + retic-choice vector.
-
-        The retic-choice vector has one slot per reticulation in the
-        network; each slot is 0 (unvisited) or a positive index
-        identifying which parent edge the lineage ascending through
-        this reticulation took.  Two configurations can only be
-        combined (by :meth:`merge`) if they agree on every shared
-        reticulation choice -- that's what :meth:`is_compatible`
-        verifies.
-
-        Using a tuple (vs a list) for the index vector matters here:
-        tuples are hashable natively, cheaper to copy, and compare
-        faster -- all of which show up in the DP hot loop.
-        """
-
-        __slots__ = ('total_prob', '_idx')
-
-        def __init__(
-            self,
-            net_node_num: int,
-            total_prob: float = 1.0,
-            net_node_index: tuple[int, ...] | None = None,
-        ) -> None:
-            """Create a new configuration.
-
-            Args:
-                net_node_num: Total number of reticulation nodes in
-                    the engine's network (i.e. the length of the
-                    retic-choice vector).
-                total_prob: Accumulated probability mass.  Starts at
-                    1.0 at the leaves and is multiplied by branch
-                    transition probabilities on the way up.
-                net_node_index: Explicit retic-choice vector; when
-                    ``None`` a zero vector is allocated.
-            """
-            self.total_prob = total_prob
-            self._idx: tuple[int, ...] = (
-                net_node_index if net_node_index is not None
-                else (0,) * net_node_num
-            )
-
-        @property
-        def net_node_index(self) -> tuple[int, ...]:
-            """Retic-choice vector (read-only view)."""
-            return self._idx
-
-        def copy(self) -> "_TripleDPEngine._Configuration":
-            """Return a shallow copy sharing the retic-choice tuple."""
-            c = _TripleDPEngine._Configuration.__new__(_TripleDPEngine._Configuration)
-            c.total_prob = self.total_prob
-            c._idx = self._idx
-            return c
-
-        @classmethod
-        def merge(
-            cls,
-            c1: "_TripleDPEngine._Configuration",
-            c2: "_TripleDPEngine._Configuration",
-        ) -> "_TripleDPEngine._Configuration":
-            """Merge two compatible configurations at a tree node.
-
-            The merged retic-choice vector is the element-wise max
-            (since one of each pair is guaranteed to be 0 when the
-            pair is compatible).  The merged probability is the
-            product -- two independent lineages joining.
-            """
-            merged = tuple(
-                max(a, b) for a, b in zip(c1._idx, c2._idx)
-            )
-            c = cls.__new__(cls)
-            c.total_prob = max(0.0, c1.total_prob * c2.total_prob)
-            c._idx = merged
-            return c
-
-        def is_compatible(self, other: "_TripleDPEngine._Configuration") -> bool:
-            """True iff ``self`` and ``other`` never disagree on a retic choice.
-
-            Two configurations are compatible when, for every
-            reticulation-index slot, at least one of them is 0
-            (unvisited) or both agree on the parent-edge choice.
-            """
-            for mine, theirs in zip(self._idx, other._idx):
-                if mine != theirs and mine != 0 and theirs != 0:
-                    return False
-            return True
-
-        def add_choice(self, net_id: int, choice: int) -> None:
-            """Record a parent-edge choice at reticulation ``net_id``."""
-            lst = list(self._idx)
-            lst[net_id] = choice
-            self._idx = tuple(lst)
-
-        def clear_choices(self) -> None:
-            """Zero out every slot in the retic-choice vector.
-
-            Used at articulation nodes where the downstream choices
-            no longer matter for the remaining DP (the articulation
-            collapses the subtree's retic history).
-            """
-            self._idx = (0,) * len(self._idx)
-
-        def __hash__(self) -> int:
-            # Hash only by retic-choice vector so dedup/merge uses
-            # the choice vector as the identity key; probabilities
-            # of equal configurations are summed by the caller.
-            return hash(self._idx)
-
-        def __eq__(self, other: object) -> bool:
-            if not isinstance(other, _TripleDPEngine._Configuration):
-                return False
-            return self._idx == other._idx
-
     def __init__(self, network: Network) -> None:
         """Bind the engine to a fixed species network.
-
-        Performs all one-time topology caching up front so the
-        per-triplet DP in :meth:`calculate_triple_probability` can
-        run without touching :class:`Network` methods.  Includes:
-
-          * a reversed topological order (leaves to root),
-          * per-node flags (is-leaf, is-retic),
-          * adjacency lists (children, parents),
-          * articulation / lowest-articulation node sets,
-          * per-edge ``(branch_length, gamma)`` tuples,
-          * an empty memoization cache for :meth:`_gij`.
 
         Args:
             network: Species network to be scored.  Must already
@@ -917,78 +713,29 @@ class _TripleDPEngine:
                 for any of that data after ``__init__`` returns.
         """
         self.network = network
-        self.net_node_num = sum(
-            1 for n in self.network.V() if self.network.in_degree(n) > 1
-        )
-        self.articulation_nodes: set[Node] = set()
-        self.lowest_articulation_nodes: set[Node] = set()
-        self._compute_articulation_nodes()
-        self._topo_leaf_to_root: list[Node] = list(
-            reversed(self.network.topological_order())
-        )
-
-        # --- Pre-cache per-node topology for hot DP loop ---
-        self._node_is_leaf: dict[Node, bool] = {}
-        self._node_is_retic: dict[Node, bool] = {}
-        self._node_children: dict[Node, list[Node]] = {}
-        self._node_parents: dict[Node, list[Node]] = {}
-        self._node_label: dict[Node, str] = {}
-        # edge key -> (branch_length, gamma)
-        self._edge_info: dict[tuple[Node, Node], tuple[float, float]] = {}
-
-        for node in self._topo_leaf_to_root:
-            out_d = network.out_degree(node)
-            in_d = network.in_degree(node)
-            self._node_is_leaf[node] = (out_d == 0)
-            self._node_is_retic[node] = (in_d > 1)
-            children = network.get_children(node)
-            self._node_children[node] = children
-            parents = network.get_parents(node)
-            self._node_parents[node] = parents
-            self._node_label[node] = node.label
-
-            for parent in parents:
-                edge = network.get_edge(parent, node)
-                bl = edge.get_length()
-                gamma = edge.get_gamma()
-                self._edge_info[(parent, node)] = (bl, gamma)
-
-        # --- Memoize _gij for the distinct branch lengths in this network ---
-        self._gij_cache: dict[tuple[float, int, int], float] = {}
+        self._rs = _MplTopology(network)
+        self.net_node_num: int = self._rs.net_node_num
+        nodes = self._rs.nodes()
+        self._topo_leaf_to_root: list[Node] = nodes
+        self.articulation_nodes: set[Node] = {
+            nodes[i] for i in self._rs.articulation_indices()
+        }
+        self.lowest_articulation_nodes: set[Node] = {
+            nodes[i] for i in self._rs.lowest_articulation_indices()
+        }
 
     def refresh_params(self) -> None:
         """Re-read branch lengths / gammas from the bound network in place.
 
-        Lever 3 fast path for the pure-Python scorer: when only continuous
-        parameters changed (topology unchanged), the cached adjacency /
-        articulation structure is still valid -- only ``_edge_info`` needs
-        refreshing.  ``_gij_cache`` is keyed by the branch-length *value*,
-        so changed lengths simply miss the old keys; no clearing is needed
-        for correctness.
+        Fast path when only continuous parameters changed: the cached
+        adjacency / articulation structure is still valid, so only the
+        per-edge values are refreshed.
         """
-        net = self.network
-        for node in self._topo_leaf_to_root:
-            for parent in self._node_parents[node]:
-                edge = net.get_edge(parent, node)
-                self._edge_info[(parent, node)] = (
-                    edge.get_length(), edge.get_gamma(),
-                )
+        self._rs.refresh_params(self.network)
 
     @staticmethod
     def _fact(start: int, end: int) -> float:
-        """Return the product ``start * (start+1) * ... * end``.
-
-        Used by :meth:`_gij_raw` to evaluate the closed-form
-        coalescent transition probability.  Empty ranges
-        (``start > end``) return 1.0.
-
-        Args:
-            start: Lower bound (inclusive).
-            end: Upper bound (inclusive).
-
-        Returns:
-            Product of integers in the closed range.
-        """
+        """Return the product ``start * (start+1) * ... * end`` (1.0 if empty)."""
         result = 1.0
         for i in range(start, end + 1):
             result *= i
@@ -998,25 +745,9 @@ class _TripleDPEngine:
     def _gij_raw(length: float, i: int, j: int) -> float:
         """Closed-form coalescent transition probability g_{ij}(t).
 
-        Computes the probability that ``i`` lineages entering a
-        branch of length ``t = length`` coalesce down to ``j`` by the
-        top of the branch, under the standard Kingman coalescent.
-
-        Special cases:
-          * ``length is None`` or ``length == -1`` are treated as an
-            infinite branch: every ancestral lineage count eventually
-            coalesces down to one, so return 1.0 iff ``j == 1``.
-          * ``length == 0`` means no coalescence can happen; return
-            1.0 iff ``i == j``.
-          * ``i == 0`` is a no-op (no lineages to coalesce).
-
-        Args:
-            length: Branch length (in coalescent units).
-            i: Lineages entering the branch.
-            j: Lineages exiting the branch (``1 <= j <= i``).
-
-        Returns:
-            Transition probability in [0, 1].
+        ``length is None`` or ``-1`` is an infinite branch (1.0 iff
+        ``j == 1``); ``length == 0`` allows no coalescence (1.0 iff
+        ``i == j``); ``i == 0`` is a no-op.
         """
         if length is None or length == -1:
             return 1.0 if j == 1 else 0.0
@@ -1024,7 +755,6 @@ class _TripleDPEngine:
             return 1.0 if i == j else 0.0
         if i == 0:
             return 1.0
-
         _fact = _TripleDPEngine._fact
         result = 0.0
         for k in range(j, i + 1):
@@ -1039,653 +769,71 @@ class _TripleDPEngine:
             result += temp / denom
         return result
 
-    def _gij(self, length: float, i: int, j: int) -> float:
-        """Memoized wrapper around :meth:`_gij_raw`.
-
-        Real phylogenetic networks typically have only a handful of
-        distinct (length, i, j) triples, so memoisation cuts the
-        per-triplet work significantly.
-        """
-        key = (length, i, j)
-        cached = self._gij_cache.get(key)
-        if cached is not None:
-            return cached
-        val = self._gij_raw(length, i, j)
-        self._gij_cache[key] = val
-        return val
-
-    def _is_valid_network(self, ignore_node: Node) -> bool:
-        """Structural-validity probe used during articulation discovery.
-
-        A network is considered valid here when every reachable node
-        has in-degree + out-degree compatible with "either leaf, or
-        internal non-degree-2 (unless it's the exempted node)", and
-        no reachable node refers to a parent/child that isn't itself
-        reachable.
-
-        This is called after temporarily removing a tree-edge in
-        :meth:`_compute_articulation_nodes` to see whether its
-        removal disconnects the subtree below; a disconnection means
-        the edge's endpoint is an articulation node.
-
-        Args:
-            ignore_node: Node exempted from the degree-2 filter.
-
-        Returns:
-            True iff the probed network remains structurally valid.
-        """
-        roots = self.network.roots()
-        if not roots:
-            return False
-
-        visited: set[Node] = set()
-        queue: list[Node] = [roots[0]]
-        while queue:
-            cur = queue.pop()
-            if cur in visited:
-                continue
-            visited.add(cur)
-            queue.extend(self.network.get_children(cur))
-
-        referenced: set[Node] = set()
-        for node in visited:
-            if (
-                self.network.in_degree(node) == 1
-                and self.network.out_degree(node) == 1
-                and node != ignore_node
-            ):
-                return False
-            for parent in self.network.get_parents(node):
-                referenced.add(parent)
-            for child in self.network.get_children(node):
-                referenced.add(child)
-        return len(visited) == len(referenced)
-
-    def _compute_articulation_nodes(self) -> None:
-        """Populate ``self.articulation_nodes`` / ``self.lowest_articulation_nodes``.
-
-        An articulation node is a tree node whose removal would
-        disconnect one or more leaves from the root.  A "lowest"
-        articulation node is an articulation whose children are not
-        all themselves articulations -- these are exactly the nodes
-        at which the DP can collapse compatible configurations
-        (matching PhyloNet's semantics).
-
-        Called once from ``__init__``; results are cached on the
-        instance and read during :meth:`calculate_triple_probability`.
-        """
-        self.articulation_nodes.clear()
-        self.lowest_articulation_nodes.clear()
-
-        for node in reversed(self.network.topological_order()):
-            is_leaf = self.network.out_degree(node) == 0
-            is_root = node == self.network.root()
-            is_tree_node = self.network.in_degree(node) <= 1 and not is_leaf
-
-            if is_leaf:
-                self.articulation_nodes.add(node)
-                continue
-
-            all_children_articulate = all(
-                child in self.articulation_nodes
-                for child in self.network.get_children(node)
-            )
-
-            if is_root:
-                if not all_children_articulate:
-                    self.lowest_articulation_nodes.add(node)
-                self.articulation_nodes.add(node)
-                continue
-
-            if is_tree_node:
-                if all_children_articulate:
-                    self.articulation_nodes.add(node)
-                else:
-                    parent = self.network.get_parents(node)[0]
-                    edge = self.network.get_edge(parent, node)
-                    self.network.remove_edge(edge)
-                    disconnect = self._is_valid_network(parent)
-                    self.network.add_edges(edge)
-                    if disconnect:
-                        self.lowest_articulation_nodes.add(node)
-                        self.articulation_nodes.add(node)
-
-    def _compute_ac_minus(
-        self,
-        cacs: dict[int, list["_TripleDPEngine._Configuration"]],
-        branch_length: float,
-        inheritance_prob: float,
-    ) -> dict[int, list["_TripleDPEngine._Configuration"]]:
-        """Propagate DP configurations through one branch, bottom to top.
-
-        Implements the ``AC+ -> AC-`` transition in PhyloNet
-        notation: given the configurations at the child end of a
-        branch (``cacs``), compute the configurations at the parent
-        end after applying both the inheritance-probability factor
-        (on reticulation edges) and the coalescent reduction factor
-        (on any branch where multiple lineages entered).
-
-        For each source state, :data:`_COALESCING_MAP` lists the
-        ``(target_state, (lineages_in, lineages_out))`` transitions
-        available on this branch.  We loop over them, multiply each
-        configuration's probability by
-        ``gamma**lineages_in * g_{in,out}(length)``, and aggregate
-        identical retic-choice vectors by summing probabilities.
-
-        Args:
-            cacs: State/config map at the bottom of the branch.
-            branch_length: Branch length (coalescent units).
-            inheritance_prob: Reticulation gamma (1.0 on tree edges).
-
-        Returns:
-            State/config map at the top of the branch.
-        """
-        ac_minus_map: dict[
-            int,
-            dict[
-                _TripleDPEngine._Configuration,
-                _TripleDPEngine._Configuration,
-            ],
-        ] = {}
-
-        for state_id, configs in cacs.items():
-            for target_state, (lineages_in, lineages_out) in self._COALESCING_MAP[state_id]:
-                # Start with inheritance contribution; for tree edges this is 1.
-                prob = 1.0
-                if inheritance_prob != 1.0:
-                    prob = inheritance_prob ** lineages_in
-
-                # Apply coalescent reduction probability on this branch.
-                if lineages_in > 1:
-                    prob *= self._gij(branch_length, lineages_in, lineages_out)
-                    if lineages_in == 3 and lineages_out != 3:
-                        prob = prob / 3.0
-
-                if prob == 0:
-                    continue
-
-                # Aggregate equal configurations by summing their probabilities.
-                state_map = ac_minus_map.setdefault(target_state, {})
-                for config in configs:
-                    copy = config.copy()
-                    new_prob = max(0.0, copy.total_prob * prob)
-                    existing = state_map.get(copy)
-                    if existing is None:
-                        copy.total_prob = new_prob
-                        state_map[copy] = copy
-                    else:
-                        existing.total_prob += new_prob
-
-        ac_minus: dict[int, list[_TripleDPEngine._Configuration]] = {}
-        for state_id, cfg_map in ac_minus_map.items():
-            ac_minus[state_id] = list(cfg_map.keys())
-        return ac_minus
-
-    def _split_at_network_node(
-        self,
-        cacs: dict[int, list["_TripleDPEngine._Configuration"]],
-        net_node_id: int,
-    ) -> tuple[
-        dict[int, list["_TripleDPEngine._Configuration"]],
-        dict[int, list["_TripleDPEngine._Configuration"]],
-    ]:
-        """Split configurations at a reticulation into its two parent edges.
-
-        At a reticulation node with lineage state ``s``,
-        :data:`_SPLITTING_MAP` lists each way ``s`` can be partitioned
-        into ``(s1, s2)`` across the two parent edges.  For each
-        (config, partition) pair we emit two new configurations,
-        annotate each with the parent-edge choice (via
-        :meth:`_Configuration.add_choice`), and multiply the
-        probability by ``sqrt(total)`` -- this is the symmetric split
-        of the joint mass, which is later completed by the
-        inheritance-probability multiplier applied in
-        :meth:`_compute_ac_minus`.
-
-        Args:
-            cacs: Incoming state/config map (at the reticulation).
-            net_node_id: Index of the reticulation currently being
-                processed; used to slot the parent-edge choice into
-                the retic-choice vector.
-
-        Returns:
-            ``(ac_plus_1, ac_plus_2)``: configuration maps for the
-            first and second parent-edge branches, respectively.
-        """
-        ac_plus_1: dict[int, list[_TripleDPEngine._Configuration]] = {}
-        ac_plus_2: dict[int, list[_TripleDPEngine._Configuration]] = {}
-        net_index = 1
-
-        for state_id, configs in cacs.items():
-            for split1, split2 in self._SPLITTING_MAP[state_id]:
-                list1 = ac_plus_1.setdefault(split1, [])
-                list2 = ac_plus_2.setdefault(split2, [])
-
-                op_list1: Optional[list[_TripleDPEngine._Configuration]] = None
-                op_list2: Optional[list[_TripleDPEngine._Configuration]] = None
-                if state_id != 0:
-                    op_list1 = ac_plus_1.setdefault(split2, [])
-                    op_list2 = ac_plus_2.setdefault(split1, [])
-
-                for config in configs:
-                    # Probabilities are split symmetrically before applying
-                    # edge-specific inheritance/coalescent transitions.
-                    prob = math.sqrt(config.total_prob)
-                    new_cfg_1 = config.copy()
-                    new_cfg_1.add_choice(net_node_id, net_index)
-                    new_cfg_1.total_prob = prob
-                    new_cfg_2 = new_cfg_1.copy()
-                    new_cfg_2.total_prob = prob
-                    list1.append(new_cfg_1)
-                    list2.append(new_cfg_2)
-                    net_index += 1
-
-                    if state_id != 0 and op_list1 is not None and op_list2 is not None:
-                        new_cfg_1 = config.copy()
-                        new_cfg_1.add_choice(net_node_id, net_index)
-                        new_cfg_1.total_prob = prob
-                        new_cfg_2 = new_cfg_1.copy()
-                        new_cfg_2.total_prob = prob
-                        op_list1.append(new_cfg_1)
-                        op_list2.append(new_cfg_2)
-                        net_index += 1
-
-        return ac_plus_1, ac_plus_2
-
     def calculate_triple_probability(self, triple: tuple[str, str, str]) -> float:
         """Compute ``P(xy|z)`` for one ordered triplet against this network.
 
         The triplet is interpreted as "x and y are siblings, z is the
         outgroup".  To get ``P(xz|y)`` or ``P(yz|x)`` call this method
-        again with the taxa reordered.
-
-        Algorithm (leaves to root pass):
-
-          1. Initialise DP at each leaf whose label is in the triple
-             (assigning lineage-state 1, 2, or 3 depending on position
-             in ``triple``).
-          2. Walk :attr:`_topo_leaf_to_root`.  For each internal tree
-             node, merge child configurations using
-             :data:`_MERGING_MAP` (and collapse at articulation
-             nodes).  For each reticulation node, split
-             configurations across both parent edges via
-             :meth:`_split_at_network_node`.
-          3. Propagate through each parent branch via
-             :meth:`_compute_ac_minus`, which applies the
-             inheritance-probability factor and the coalescent
-             reduction.
-          4. Terminate early at the root (or at any articulation that
-             has fully collapsed the triplet): sum probabilities in
-             the "fully coalesced" states (7 / 9 / 10) to get the
-             final triplet probability.
+        again with the taxa reordered.  A label that is not a leaf of
+        the network contributes no lineage, so the probability is 0.
 
         Args:
-            triple: Ordered species labels ``(x, y, z)``; see above for
-                how ordering maps to the returned resolution.
+            triple: Ordered species labels ``(x, y, z)``.
 
         Returns:
             ``P(xy|z)`` under the species network.
         """
-        triple_list = list(triple)
-        edge_to_ac_minus: dict[
-            tuple[Node, Node],
-            dict[int, list[_TripleDPEngine._Configuration]],
-        ] = {}
-        net_node_id = 0
-        total_prob = 0.0
-
-        _Cfg = self._Configuration
-        nnn = self.net_node_num
-        node_is_leaf = self._node_is_leaf
-        node_is_retic = self._node_is_retic
-        node_children = self._node_children
-        node_parents = self._node_parents
-        node_label = self._node_label
-        edge_info = self._edge_info
-        lowest_art = self.lowest_articulation_nodes
-        art_nodes = self.articulation_nodes
-        MERGING = self._MERGING_MAP
-
-        for node in self._topo_leaf_to_root:
-            cacs = None
-            is_leaf = node_is_leaf[node]
-            is_retic = node_is_retic[node]
-
-            # --- Seed DP at each relevant leaf ---------------------
-            if is_leaf:
-                lbl = node_label[node]
-                if lbl in triple_list:
-                    idx = triple_list.index(lbl)
-                    # Lineage state = 1, 2, or 3 depending on the
-                    # leaf's position in the input ``triple``.
-                    cacs = {idx + 1: [_Cfg(nnn)]}
-
-            # --- Reticulations: inherit one child's config ----------
-            elif is_retic:
-                # Reticulations always have a single child edge; the
-                # AC- from that child becomes the incoming state.
-                children = node_children[node]
-                if children:
-                    cacs = edge_to_ac_minus.get((node, children[0]))
-
-            # --- Internal tree nodes: merge children -----------------
-            else:
-                children = node_children[node]
-                if len(children) >= 2:
-                    ac1 = edge_to_ac_minus.get((node, children[0]))
-                    ac2 = edge_to_ac_minus.get((node, children[1]))
-
-                    # Only one child carries any DP state: adopt its
-                    # configurations directly, collapsing at lowest
-                    # articulation nodes where retic-choice histories
-                    # no longer need to be distinguished.
-                    if (ac1 is None) ^ (ac2 is None):
-                        cacs = ac2 if ac1 is None else ac1
-                        if node in lowest_art:
-                            for state, config_list in list(cacs.items()):
-                                if not config_list:
-                                    continue
-                                merged = config_list[0]
-                                for config in config_list[1:]:
-                                    merged.total_prob += config.total_prob
-                                merged.clear_choices()
-                                cacs[state] = [merged]
-                    # Both children carry DP state: merge every
-                    # compatible (cfg1, cfg2) pair via _MERGING_MAP.
-                    elif ac1 is not None and ac2 is not None:
-                        cacs = {}
-                        is_articulation = node in lowest_art
-                        for state1, cfgs1 in ac1.items():
-                            for state2, cfgs2 in ac2.items():
-                                can_merge = state1 == 0 or state2 == 0
-                                target_state = state1 if state1 != 0 else state2
-                                if not can_merge:
-                                    key = (state1, state2) if state1 < state2 else (state2, state1)
-                                    ts = MERGING.get(key)
-                                    if ts is not None:
-                                        target_state = ts
-                                        can_merge = True
-                                if not can_merge:
-                                    continue
-
-                                merged_list = cacs.setdefault(target_state, [])
-                                merged_articulation_cfg = None
-                                for cfg1 in cfgs1:
-                                    for cfg2 in cfgs2:
-                                        if not cfg1.is_compatible(cfg2):
-                                            continue
-                                        if is_articulation:
-                                            if not merged_list:
-                                                merged_articulation_cfg = _Cfg.merge(
-                                                    cfg1, cfg2
-                                                )
-                                                merged_articulation_cfg.clear_choices()
-                                                merged_list.append(merged_articulation_cfg)
-                                            else:
-                                                if merged_articulation_cfg is None:
-                                                    merged_articulation_cfg = merged_list[0]
-                                                merged_articulation_cfg.total_prob += max(
-                                                    0.0, cfg1.total_prob * cfg2.total_prob
-                                                )
-                                        else:
-                                            merged_list.append(_Cfg.merge(cfg1, cfg2))
-
-                                if not merged_list:
-                                    cacs.pop(target_state, None)
-
-            if cacs is None:
-                continue
-
-            # --- Early termination at articulation w/ full coalescence ---
-            # State 7 means all three lineages are present but not yet
-            # fully coalesced (divide by 3 to select the target
-            # resolution); states 9 and 10 represent progressively more
-            # coalesced configurations that already pin the resolution.
-            if 7 in cacs and node in art_nodes:
-                total_prob = cacs[7][0].total_prob / 3.0
-                if 9 in cacs:
-                    total_prob += cacs[9][0].total_prob
-                if 10 in cacs:
-                    total_prob += cacs[10][0].total_prob
-                break
-
-            # --- Propagate through parent branch(es) ---------------
-            if is_retic:
-                # Reticulation: split state across the two parent
-                # edges, then independently propagate each half.
-                ac_plus_1, ac_plus_2 = self._split_at_network_node(cacs, net_node_id)
-                net_node_id += 1
-                parents = node_parents[node]
-                for idx, parent in enumerate(parents):
-                    bl, gamma = edge_info[(parent, node)]
-                    inheritance_prob = gamma if gamma is not None else 1.0 / len(parents)
-
-                    ac_plus = ac_plus_1 if idx == 0 else ac_plus_2
-                    ac_minus = self._compute_ac_minus(
-                        ac_plus,
-                        branch_length=bl,
-                        inheritance_prob=inheritance_prob,
-                    )
-                    edge_to_ac_minus[(parent, node)] = ac_minus
-            else:
-                # Tree node: single parent, no inheritance factor.
-                parents = node_parents[node]
-                if parents:
-                    parent = parents[0]
-                    bl, _gamma = edge_info[(parent, node)]
-                    ac_minus = self._compute_ac_minus(
-                        cacs,
-                        branch_length=bl,
-                        inheritance_prob=1.0,
-                    )
-                    edge_to_ac_minus[(parent, node)] = ac_minus
-
-        return total_prob
+        x, y, z = triple
+        return self._rs.triple_probability(str(x), str(y), str(z))
 
 
 # ======================================================================
-# (E) Cython bridge
+# (E) Compiled bridge
 #
-# The Cython implementation mirrors :meth:`_TripleDPEngine.calculate_triple_probability`
-# but operates on flat numpy arrays instead of Python dicts, which is
-# where most of the 10-20x speedup comes from.  When the ``.so`` isn't
-# available the Python DP is used instead; both compute the same
-# quantity to full floating-point accuracy.
+# The names below predate the Rust core (they used to shuttle numpy arrays
+# into a Cython kernel).  They are kept so the scorer and DIMPLE's subset
+# scorer keep working unchanged; each is now a thin call into the engine.
 # ======================================================================
 
-# These caps bound the node arity assumed by the Cython extension.
-# Phylogenetic networks in the wild almost always have binary internal
-# nodes with at most two parents per reticulation, so these are
-# generous upper bounds.
 _CY_MAX_CHILDREN = 4
 _CY_MAX_PARENTS = 2
 
 
-def _extract_topology_for_cython(engine: _TripleDPEngine) -> dict:
-    """Flatten a :class:`_TripleDPEngine`'s topology into numpy arrays.
-
-    The Cython engine can't accept Python :class:`Node` objects
-    directly, so this helper walks the engine's cached topology and
-    produces a ``dict`` of numpy arrays keyed by flat node indices
-    (0..n_nodes-1, matching the engine's leaves-to-root traversal
-    order).  The resulting dict is shaped exactly the way
-    ``mpl_engine_cy.score_all_triplets`` expects.
-
-    Args:
-        engine: Python DP engine already initialised on the target
-            network (and thus holding all cached topology data).
-
-    Returns:
-        ``dict`` with numpy arrays for adjacency, branch lengths,
-        gammas, articulation flags, and a ``label_to_idx`` map so
-        callers can translate species labels into flat indices.
-    """
-    nodes = engine._topo_leaf_to_root
-    n_nodes = len(nodes)
-    node_to_idx: dict[Node, int] = {node: i for i, node in enumerate(nodes)}
-
-    is_leaf = np.zeros(n_nodes, dtype=np.intc)
-    is_retic = np.zeros(n_nodes, dtype=np.intc)
-    in_art = np.zeros(n_nodes, dtype=np.intc)
-    in_low_art = np.zeros(n_nodes, dtype=np.intc)
-    n_ch = np.zeros(n_nodes, dtype=np.intc)
-    ch = np.full((n_nodes, _CY_MAX_CHILDREN), -1, dtype=np.intc)
-    n_pa = np.zeros(n_nodes, dtype=np.intc)
-    pa = np.full((n_nodes, _CY_MAX_PARENTS), -1, dtype=np.intc)
-    pa_bl = np.ones((n_nodes, _CY_MAX_PARENTS), dtype=np.float64)
-    pa_gamma = np.ones((n_nodes, _CY_MAX_PARENTS), dtype=np.float64)
-    ch_pa_slot = np.full((n_nodes, _CY_MAX_CHILDREN), 0, dtype=np.intc)
-
-    label_to_idx: dict[str, int] = {}
-
-    for i, node in enumerate(nodes):
-        is_leaf[i] = 1 if engine._node_is_leaf[node] else 0
-        is_retic[i] = 1 if engine._node_is_retic[node] else 0
-        in_art[i] = 1 if node in engine.articulation_nodes else 0
-        in_low_art[i] = 1 if node in engine.lowest_articulation_nodes else 0
-
-        children = engine._node_children[node]
-        n_ch[i] = len(children)
-        for j, child in enumerate(children[:_CY_MAX_CHILDREN]):
-            ch[i, j] = node_to_idx[child]
-
-        parents = engine._node_parents[node]
-        n_pa[i] = len(parents)
-        for j, parent in enumerate(parents[:_CY_MAX_PARENTS]):
-            pa[i, j] = node_to_idx[parent]
-            bl, gamma = engine._edge_info.get((parent, node), (1.0, None))
-            pa_bl[i, j] = bl if bl is not None else -1.0
-            if engine._node_is_retic[node]:
-                if gamma is not None and gamma > 0:
-                    pa_gamma[i, j] = gamma
-                else:
-                    pa_gamma[i, j] = 1.0 / len(parents)
-            else:
-                pa_gamma[i, j] = 1.0
-
-        if is_leaf[i]:
-            label_to_idx[engine._node_label[node]] = i
-
-    for i, node in enumerate(nodes):
-        children = engine._node_children[node]
-        for j, child in enumerate(children[:_CY_MAX_CHILDREN]):
-            child_parents = engine._node_parents[child]
-            for k, p in enumerate(child_parents[:_CY_MAX_PARENTS]):
-                if node_to_idx[p] == i:
-                    ch_pa_slot[i, j] = k
-                    break
-
-    return {
-        "n_nodes": n_nodes,
-        "net_node_num": engine.net_node_num,
-        "is_leaf": is_leaf,
-        "is_retic": is_retic,
-        "in_art": in_art,
-        "in_low_art": in_low_art,
-        "n_children": n_ch,
-        "children": ch,
-        "n_parents": n_pa,
-        "parents": pa,
-        "pa_bl": pa_bl,
-        "pa_gamma": pa_gamma,
-        "ch_pa_slot": ch_pa_slot,
-        "label_to_idx": label_to_idx,
-    }
+def _extract_topology_for_cython(engine: _TripleDPEngine) -> "_MplTopology":
+    """The compiled topology bound to ``engine`` (cached on the engine)."""
+    return engine._rs
 
 
 def _build_cython_triplet_index(
-    topo: dict,
+    topo: "_MplTopology",
     triplets: list[tuple[str, str, str]],
     rho: dict[tuple[str, str, str], tuple[float, float, float]],
-) -> tuple[list[tuple[int, int, int]], list[tuple[float, float, float]]]:
-    """Translate species triplets into flat node indices for the Cython DP.
+) -> tuple["_TripletIndex", None]:
+    """Translate species triplets into leaf indices for the compiled DP.
 
     Triplets whose taxa are not all present in the network are silently
-    dropped (mirrors the Python path).  Depends only on the *topology*
-    (the ``label_to_idx`` map), so it is stable across branch-length /
-    gamma edits and can be cached alongside the extracted topology.
-
-    Args:
-        topo: The dict returned by :func:`_extract_topology_for_cython`.
-        triplets: Canonical species triplets to evaluate.
-        rho: Gene-tree triplet frequency table (constant for the run).
+    dropped (mirrors the Python path).  Depends only on the topology, so
+    it is stable across branch-length / gamma edits.
 
     Returns:
-        ``(trip_idx, rho_vals)`` lists aligned by position.
+        ``(index, None)``: the compiled index and a placeholder for the
+        former rho list, which now lives inside the index.
     """
-    lbl_idx = topo["label_to_idx"]
-    trip_idx: list[tuple[int, int, int]] = []
-    rho_vals: list[tuple[float, float, float]] = []
-    for t in triplets:
-        x, y, z = t
-        if x in lbl_idx and y in lbl_idx and z in lbl_idx:
-            trip_idx.append((lbl_idx[x], lbl_idx[y], lbl_idx[z]))
-            rho_vals.append(rho[t])
-    return trip_idx, rho_vals
+    return topo.build_triplet_index([tuple(t) for t in triplets], rho), None
 
 
-def _refresh_cython_params(engine: _TripleDPEngine, topo: dict) -> None:
-    """Re-read branch lengths / gammas into a cached Cython topology dict.
-
-    Lever 3 fast path: when only continuous parameters changed (the
-    topology is unchanged), the structural arrays in ``topo`` are still
-    valid -- only ``pa_bl`` / ``pa_gamma`` need updating from the live
-    network edges.  This mirrors exactly the parameter logic in
-    :func:`_extract_topology_for_cython` so a refreshed score is bit-for-bit
-    identical to a full rebuild.  The engine's ``_edge_info`` cache is kept
-    in sync for the pure-Python scoring path.
-
-    Args:
-        engine: The persistent engine bound to the (unchanged) topology.
-        topo: The cached dict from :func:`_extract_topology_for_cython`,
-            whose ``pa_bl`` / ``pa_gamma`` arrays are updated in place.
-    """
-    net = engine.network
-    nodes = engine._topo_leaf_to_root
-    pa_bl = topo["pa_bl"]
-    pa_gamma = topo["pa_gamma"]
-    for i, node in enumerate(nodes):
-        parents = engine._node_parents[node]
-        is_ret = engine._node_is_retic[node]
-        n_par = len(parents)
-        for j, parent in enumerate(parents[:_CY_MAX_PARENTS]):
-            edge = net.get_edge(parent, node)
-            bl = edge.get_length()
-            gamma = edge.get_gamma()
-            engine._edge_info[(parent, node)] = (bl, gamma)
-            pa_bl[i, j] = bl if bl is not None else -1.0
-            if is_ret:
-                if gamma is not None and gamma > 0:
-                    pa_gamma[i, j] = gamma
-                else:
-                    pa_gamma[i, j] = 1.0 / n_par
-            else:
-                pa_gamma[i, j] = 1.0
+def _refresh_cython_params(engine: _TripleDPEngine, topo: "_MplTopology") -> None:
+    """Re-read branch lengths / gammas into the compiled topology."""
+    topo.refresh_params(engine.network)
 
 
 def _cy_score_from_topo(
-    topo: dict,
-    trip_idx: list[tuple[int, int, int]],
-    rho_vals: list[tuple[float, float, float]],
+    topo: "_MplTopology",
+    trip_idx: "_TripletIndex",
+    rho_vals=None,
 ) -> float:
-    """Run the Cython DP from a (possibly cached) extracted topology."""
-    return _cy_score(
-        topo["n_nodes"],
-        topo["net_node_num"],
-        topo["is_leaf"],
-        topo["is_retic"],
-        topo["in_art"],
-        topo["in_low_art"],
-        topo["n_children"],
-        topo["children"],
-        topo["n_parents"],
-        topo["parents"],
-        topo["pa_bl"],
-        topo["pa_gamma"],
-        topo["ch_pa_slot"],
-        trip_idx,
-        rho_vals,
-    )
+    """Run the compiled DP over a prebuilt triplet index."""
+    return topo.score(trip_idx)
 
 
 def _score_with_cython(
@@ -1693,23 +841,23 @@ def _score_with_cython(
     triplets: list[tuple[str, str, str]],
     rho: dict[tuple[str, str, str], tuple[float, float, float]],
 ) -> float:
-    """Score a network against all triplets via the Cython DP engine.
+    """Score a network against all triplets via the compiled DP engine.
 
     Triplets whose taxa are not all present in the engine's network
     are silently dropped -- this mirrors the Python path's behaviour
     and keeps the pruned-taxa case working.
 
     Args:
-        engine: Python DP engine already bound to the target network.
+        engine: DP engine already bound to the target network.
         triplets: Canonical species triplets to evaluate.
         rho: Gene-tree triplet frequency table (constant for the run).
 
     Returns:
         Log pseudo-likelihood across all evaluable triplets.
     """
-    topo = _extract_topology_for_cython(engine)
-    trip_idx, rho_vals = _build_cython_triplet_index(topo, triplets, rho)
-    return _cy_score_from_topo(topo, trip_idx, rho_vals)
+    topo = engine._rs
+    index = topo.build_triplet_index([tuple(t) for t in triplets], rho)
+    return topo.score(index)
 
 
 # ======================================================================

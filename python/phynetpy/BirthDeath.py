@@ -38,7 +38,7 @@ SOURCES:
 import math
 import random
 import numpy as np
-import scipy
+from . import _core
 from .Network import Network, Node, Edge
 from math import log, exp
 from typing import Union
@@ -280,7 +280,8 @@ class Yule:
         """
         scale = 1 / (self.lin * self.gamma)
         random_float_01 : float  = self.rng.random()
-        return scipy.stats.expon.ppf(random_float_01, scale = scale)# type: ignore
+        # Inverse CDF of the exponential distribution (scipy's expon.ppf).
+        return -scale * math.log1p(-random_float_01)
 
     def _event(self, network : Network) -> int: 
         """
@@ -358,81 +359,27 @@ class Yule:
         events until there are exactly N live species.
 
         After the nth event, draw one more time and fill out the remaining
-        branch lengths.
+        branch lengths.  The event loop runs in the compiled core and draws
+        from ``self.rng`` in the same order as before, so a seeded run
+        reproduces.
 
         Args:
             N/A
         Returns:
             Network: The simulated tree
         """
-        net : Network = Network()
-        
-        # Set up the tree with 2 living lineages and an "internal" root node
-        node1 = Node("root", 
-                     attr={"t" : 0, "label" : "root", "live" : False},
-                     t = 0)
-        node2 = Node("spec1", attr={"live" : True})
-        node3 = Node("spec2", attr={"live" : True})
-
-        
-        net.add_nodes(node1, node2, node3)
-        net.add_edges([Edge(node1, node2), Edge(node1, node3)])
-        
-            
-        # until the tree contains N extant taxa, keep having speciation events
-        if self.condition == "N":
-            if self.N == 2:
-                node2.set_time(1)
-                node3.set_time(1)
-                return net
-            
-            #create N lineages
-            while len(live_species(net.V())) < self.N:
-                self._event(net)
-
-            # populate remaining branches with branch lengths according to
-            # Eq 5.1? Just taking sigma_n for now
-            next_time = self._draw_waiting_time()
-
-            for node in live_species(net.V()):
-                node.add_attribute("t", self.elapsed_time + next_time)
-                node.set_time(self.elapsed_time + next_time)
-                parents = net.get_parents(node)
-                if len(parents) != 0:
-                    parent = parents[0]
-                    parent_time = parent.get_time()
-                    final_len= self.elapsed_time + next_time - parent_time
-                    net.get_edge(parent, node).set_length(final_len)
-                
-            # reset the elapsed time to 0, and the number of live branches to 2
-            # for correctness generating future trees
-            self.elapsed_time = 0
-            self.lin = 2
-
-        else:
-            while self.elapsed_time < self.time:
-                status = self._event(net)
-                if status == -1:
-                    break
-
-            for node in live_species(net.V()):
-                # the live lineages are all leaves, 
-                # and are thus all at the goal time
-                node.add_attribute("t", self.time)
-                node.set_time(self.time)
-                
-                #calculate branch lengths
-                parent = net.get_parents(node)[0]
-                parent_time = parent.get_time()
-                
-                #set branch lengths
-                net.get_edge(parent, node).set_length(self.time - parent_time)
-                
-            # reset the elapsed time to 0, and the number of live branches to 2
-            # for correctness generating future trees
-            self.elapsed_time = 0
-            self.lin = 2
-        
+        net, self.internal_count = _core.yule_generate(
+            self.rng,
+            float(self.gamma),
+            self.condition,
+            int(self.N) if self.condition == "N" else 0,
+            float(self.time) if self.condition == "T" else 0.0,
+            int(self.internal_count),
+        )
+        # reset the elapsed time to 0, and the number of live branches to 2
+        # for correctness generating future trees
+        self.elapsed_time = 0
+        self.lin = 2
         return net
 
     def clear_generated(self) -> None:
@@ -613,51 +560,15 @@ class CBDP:
         """
         Simulate a single network under the Constant Rate Birth Death Model.
         
-        Follows the algorithm laid out by (2)
+        Follows the algorithm laid out by (2); the construction runs in the
+        compiled core.
 
         Args:
             N/A
         Returns: 
             (Network) A network with n taxa chosen from the distributions.
         """
-        net = Network()
-
-        # step 1
-        r = [random.random() for _ in range(self.N)]
-
-        # step 2
-        t = self._qinv(r[0])
-
-        # step 3
-        s = {self._finv(r[i], t): (i + .5) for i in range(1, self.N)}
-
-        # step 4 setup
-
-        sKeys = list(s.keys())
-
-        # set up leaf nodes and internal nodes in proper order (fig 5)
-        for j in range(2 * self.N - 1):
-            if j % 2 == 0:
-                # leaf node - mark as living
-                leaf = Node(attr={"t": t, "live": True}, name="T" + str(int(j / 2) + 1))
-                net.add_nodes(leaf)
-                leaf.set_time(t)
-                
-            else:
-                # internal node - mark as not living
-                internal = Node(attr={"t": sKeys[int((j - 1) / 2)], "live": False}, 
-                                name="internal" + str(int((j - 1) / 2)))
-                net.add_nodes(internal)
-                internal.set_time(sKeys[int((j - 1) / 2)])
-
-        # step 4
-        for i in range(2 * self.N - 1):
-            # for each node, connect it to the correct parent
-            new_edge : Union[Edge, None] = self._connect(i, net.V())
-            if new_edge is not None:
-                net.add_edges(new_edge)
-
-        return net
+        return _core.cbdp_generate(float(self.gamma), float(self.mu), int(self.N))
 
     @staticmethod
     def _connect(index : int, nodes : list[Node]) -> Union[Edge, None]:

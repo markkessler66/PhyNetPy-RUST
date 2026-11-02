@@ -20,3 +20,6 @@ runs/
 reports/
 example_output.nex
 tests/crosscheck/*.class
+
+# Claude Code subagent worktrees
+.claude/worktrees/

@@ -10,6 +10,7 @@ pub mod graph;
 pub mod io;
 pub mod kernels;
 pub mod search;
+pub mod sim;
 pub mod util;
 
 #[pymodule]
@@ -37,5 +38,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     kernels::optimize::register(m)?;
     io::register(m)?;
     search::moves::register(m)?;
+    sim::birthdeath::register(m)?;
     Ok(())
 }

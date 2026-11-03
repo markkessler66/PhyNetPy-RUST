@@ -64,7 +64,7 @@ changed in the port.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install maturin pytest numpy matplotlib biopython python-nexus pulp
+pip install maturin pytest scipy numpy matplotlib networkx biopython python-nexus pulp
 maturin develop            # build the extension into the venv (add --release for speed)
 python -m pytest -m "not slow"
 ```

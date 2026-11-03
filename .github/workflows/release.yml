@@ -21,6 +21,7 @@ jobs:
   linux:
     runs-on: ubuntu-22.04
     strategy:
+      fail-fast: false
       matrix:
         target: [x86_64, aarch64]
     steps:
@@ -48,12 +49,13 @@ jobs:
           python -m venv .ci-venv
           source .ci-venv/bin/activate
           pip install --quiet phynetpy-rs --no-index --no-deps --find-links dist --force-reinstall
-          pip install --quiet phynetpy-rs pytest
+          pip install --quiet --find-links dist "phynetpy-rs[test]"
           python -m pytest tests -q -p no:cacheprovider
 
   macos:
     runs-on: ${{ matrix.platform.runner }}
     strategy:
+      fail-fast: false
       matrix:
         platform:
           - runner: macos-15-intel
@@ -83,7 +85,7 @@ jobs:
           python -m venv .ci-venv
           source .ci-venv/bin/activate
           pip install --quiet phynetpy-rs --no-index --no-deps --find-links dist --force-reinstall
-          pip install --quiet phynetpy-rs pytest
+          pip install --quiet --find-links dist "phynetpy-rs[test]"
           python -m pytest tests -q -p no:cacheprovider
 
   windows:
@@ -112,7 +114,7 @@ jobs:
           python -m venv .ci-venv
           source .ci-venv/Scripts/activate
           pip install --quiet phynetpy-rs --no-index --no-deps --find-links dist --force-reinstall
-          pip install --quiet phynetpy-rs pytest
+          pip install --quiet --find-links dist "phynetpy-rs[test]"
           python -m pytest tests -q -p no:cacheprovider
 
   sdist:

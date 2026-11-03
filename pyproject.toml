@@ -35,6 +35,7 @@ classifiers = [
 dependencies = [
     "numpy>=1.19.0",
     "matplotlib>=3.3.0",
+    "networkx>=2.5",
     "biopython>=1.78",
     "python-nexus",
     "pulp",
@@ -42,7 +43,7 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
-test = ["pytest", "coverage"]
+test = ["pytest", "coverage", "scipy>=1.5.0"]
 dev = ["pytest", "coverage", "maturin>=1.7,<2.0", "build", "twine"]
 
 [project.urls]

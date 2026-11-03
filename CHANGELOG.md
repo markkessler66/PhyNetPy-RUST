@@ -37,10 +37,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Still Python by design: the search drivers and samplers' control loops,
   `infer`/`score` and the registry, the data containers, multiprocessing,
   printing and plotting, and `Validation`.
-- `networkx`, `scipy` and `scikit-learn` are no longer used; `biopython`
-  and `python-nexus` are only imported by `Validation`. SciPy's
+- `scipy` and `scikit-learn` are no longer runtime dependencies (`scipy`
+  is still used by the test suite as a reference); `biopython` and
+  `python-nexus` are only imported by `Validation`; `networkx` is only
+  used by `Network.to_networkx` and `is_isomorphic`. SciPy's
   `linear_sum_assignment` and NetworkX's `find_cliques` are reimplemented
-  with identical tie-breaking.
+  in Rust with identical tie-breaking.
 - Installing from source needs a Rust toolchain; wheels do not.
 
 ### Fixed

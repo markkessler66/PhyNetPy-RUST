@@ -4,18 +4,23 @@ PhyNetPy is a Python library for phylogenetic network inference and analysis. It
 provides improved implementations of methods from PhyloNet, plus a framework for
 building new Bayesian and simulation-based methods.
 
-Starting with 0.8.0 the computational core is written in Rust. The Python
-package `phynetpy` is the public API and has the same classes, functions, and
-module layout as before; underneath, the graph structures, parsers, likelihood
-kernels, and search engines run in the compiled extension `phynetpy._core`.
+This repository is the Rust-core build of PhyNetPy, published on PyPI as
+**`phynetpy-rs`**. The Python package it installs is still named `phynetpy`
+and has the same classes, functions and module layout as the pure-Python
+[PhyNetPy](https://github.com/NakhlehLab/PhyNetPy) 0.7.0; underneath, the
+graph structures, parsers, likelihood kernels, simulators and search operators
+run in the compiled extension `phynetpy._core`. Existing scripts work
+unchanged. Because both distributions provide the `phynetpy` package, install
+one or the other in a given environment, not both.
 
 ## Install
 
 ```bash
-pip install phynetpy
+pip install phynetpy-rs
 ```
 
-Wheels are published for Python 3.9 and later (one `abi3` wheel per platform).
+Wheels are published for Python 3.9 and later (one `abi3` wheel per platform
+for Linux x86_64/aarch64, macOS Intel/Apple Silicon and Windows x64).
 Installing from source needs a Rust toolchain (`rustup`), after which
 
 ```bash
@@ -73,7 +78,8 @@ facades fit together.
 CI (`.github/workflows/release.yml`) builds wheels for Linux (x86_64,
 aarch64), macOS (Intel, Apple Silicon) and Windows (x64) plus an sdist on
 every push, and runs the test suite against each wheel. Pushing a version
-tag publishes those artifacts to PyPI through trusted publishing:
+tag publishes those artifacts to PyPI as `phynetpy-rs` through trusted
+publishing:
 
 ```bash
 git tag v0.8.0

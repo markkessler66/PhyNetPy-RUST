@@ -1,9 +1,10 @@
 # Build wheels for every supported platform, run the test suite against
 # them, and publish to PyPI when a version tag (v*) is pushed.
 #
-# Publishing uses PyPI trusted publishing (OpenID Connect): register this
-# repository and workflow file on https://pypi.org/manage/project/phynetpy/settings/publishing/
-# once; no API token is stored in the repository.
+# Publishing uses PyPI trusted publishing (OpenID Connect) for the
+# distribution phynetpy-rs: register this repository and workflow file once
+# as a (pending) publisher on https://pypi.org/manage/account/publishing/;
+# no API token is stored in the repository.
 name: CI
 
 on:
@@ -46,8 +47,8 @@ jobs:
           set -e
           python -m venv .ci-venv
           source .ci-venv/bin/activate
-          pip install --quiet phynetpy --no-index --no-deps --find-links dist --force-reinstall
-          pip install --quiet phynetpy pytest
+          pip install --quiet phynetpy-rs --no-index --no-deps --find-links dist --force-reinstall
+          pip install --quiet phynetpy-rs pytest
           python -m pytest tests -q -p no:cacheprovider
 
   macos:
@@ -81,8 +82,8 @@ jobs:
           set -e
           python -m venv .ci-venv
           source .ci-venv/bin/activate
-          pip install --quiet phynetpy --no-index --no-deps --find-links dist --force-reinstall
-          pip install --quiet phynetpy pytest
+          pip install --quiet phynetpy-rs --no-index --no-deps --find-links dist --force-reinstall
+          pip install --quiet phynetpy-rs pytest
           python -m pytest tests -q -p no:cacheprovider
 
   windows:
@@ -110,8 +111,8 @@ jobs:
           set -e
           python -m venv .ci-venv
           source .ci-venv/Scripts/activate
-          pip install --quiet phynetpy --no-index --no-deps --find-links dist --force-reinstall
-          pip install --quiet phynetpy pytest
+          pip install --quiet phynetpy-rs --no-index --no-deps --find-links dist --force-reinstall
+          pip install --quiet phynetpy-rs pytest
           python -m pytest tests -q -p no:cacheprovider
 
   sdist:

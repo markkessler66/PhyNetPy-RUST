@@ -3,8 +3,8 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "phynetpy"
-description = "A library and framework for Phylogenetics research, data analytics, network inference, and network tooling."
+name = "phynetpy-rs"
+description = "PhyNetPy with a Rust core: a library and framework for phylogenetic network inference, analysis, simulation and tooling. Installs the phynetpy package."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -46,9 +46,10 @@ test = ["pytest", "coverage"]
 dev = ["pytest", "coverage", "maturin>=1.7,<2.0", "build", "twine"]
 
 [project.urls]
-Homepage = "https://github.com/NakhlehLab/PhyNetPy"
-Source = "https://github.com/NakhlehLab/PhyNetPy"
-"Bug Reports" = "https://github.com/NakhlehLab/PhyNetPy/issues"
+Homepage = "https://github.com/markkessler66/PhyNetPy-RUST"
+Source = "https://github.com/markkessler66/PhyNetPy-RUST"
+"Bug Reports" = "https://github.com/markkessler66/PhyNetPy-RUST/issues"
+"Pure-Python PhyNetPy" = "https://github.com/NakhlehLab/PhyNetPy"
 
 [tool.maturin]
 python-source = "python"

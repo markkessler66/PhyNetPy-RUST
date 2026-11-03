@@ -10,7 +10,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed -- the computational core is now Rust
 
-- The package is a Python front over the compiled extension `phynetpy._core`
+- Published on PyPI as `phynetpy-rs`; the import name stays `phynetpy`. The
+  package is a Python front over the compiled extension `phynetpy._core`
   (PyO3, one `abi3` wheel per platform for Python 3.9+). The public API,
   module names, classes, functions, signatures and docstrings are unchanged;
   every module that held computation is now a facade over Rust. Seeded runs

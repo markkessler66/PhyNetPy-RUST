@@ -59,10 +59,23 @@ changed in the port.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install maturin pytest numpy scipy scikit-learn matplotlib networkx biopython python-nexus newick pulp
+pip install maturin pytest numpy matplotlib biopython python-nexus pulp
 maturin develop            # build the extension into the venv (add --release for speed)
 python -m pytest -m "not slow"
 ```
 
 The version lives in `python/phynetpy/_version.py` and `Cargo.toml`; keep the
-two in step.
+two in step. `docs/PORTING.md` describes how the Rust core and the Python
+facades fit together.
+
+## Releasing
+
+CI (`.github/workflows/release.yml`) builds wheels for Linux (x86_64,
+aarch64), macOS (Intel, Apple Silicon) and Windows (x64) plus an sdist on
+every push, and runs the test suite against each wheel. Pushing a version
+tag publishes those artifacts to PyPI through trusted publishing:
+
+```bash
+git tag v0.8.0
+git push origin v0.8.0
+```

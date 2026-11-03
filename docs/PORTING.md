@@ -10,15 +10,28 @@ contract for every module port.
 | Path | Role |
 | --- | --- |
 | `python/phynetpy/` | The public package. Each ported module becomes a *facade*: same module name, same public and test-visible names, docstrings kept, implementation imported from `phynetpy._core`. |
-| `src/lib.rs` | Module root. Every submodule is registered here already through a `register(m)` function. **Do not edit `lib.rs`, any `mod.rs`, or `Cargo.toml`.** If you need a new crate dependency, say so in your report instead. |
+| `src/lib.rs` | Module root. Every submodule is registered here through a `register(m)` function; a new port needs a placeholder module registered first (see commit 68490ab for the pattern). **Do not edit `lib.rs`, any `mod.rs`, or `Cargo.toml`.** If you need a new crate dependency, say so in your report instead. |
 | `src/graph/` | `Node`, `Edge`, `Network` (`network.rs`), graph algorithms (`algorithms.rs`), Newick (`newick.rs`), `utils.rs` (GraphUtils). |
 | `src/kernels/` | `common.rs` (LOG_FLOOR, logaddexp, logsumexp, gij), `mask.rs` (lineage bitmasks), `msnc.rs` (coalescent DPs), `mpl.rs` (MPL triplets), `seq.rs` (sequence likelihood, GTR), `snp.rs` (biallelic markers), `allop.rs` (MP-allop), `chain.rs` (chain diagnostics), `optimize.rs` (Brent). |
-| `src/io.rs` | Newick / NEXUS / FASTA / VCF readers and writers behind `IO.py`. |
-| `src/search/` | `moves.rs` (network proposal moves). Placeholders `mcmc_seq.rs`, `mcmc_gt.rs`. |
-| `src/sim/` | `birthdeath.rs` (Yule, CBDP). Placeholders `seq.rs`, `snp.rs`. |
-| `src/graph/genetrees.rs`, `src/metrics.rs`, `src/dimple.rs` | Placeholders for the GeneTrees analysis, network metric, and DIMPLE ports. |
+| `src/io.rs` | Newick / NEXUS / FASTA / VCF readers and writers behind `IO.py`, and the NEXUS alignment reader behind `MSA.parse`. |
+| `src/search/` | `moves.rs` (network proposal moves), `mcmc_seq.rs` (MCMC_SEQ priors, UPGMA start, operators with undo handles), `mcmc_gt.rs` (MCMC_GT priors, displayed trees, likelihood engine). |
+| `src/sim/` | `birthdeath.rs` (Yule, CBDP), `seq.rs` (gene-tree, sequence and multilocus simulation), `snp.rs` (random networks, biallelic markers). |
+| `src/graph/genetrees.rs` | GeneTrees analysis: mappings, cluster/split support, RF, consensus, concordance factors, duplication-loss. |
+| `src/metrics.rs` | ReticulationComparison and JointDissimilarity, including a port of SciPy's assignment solver. |
+| `src/dimple.rs` | DIMPLE compute stages: partitioning, restriction, compatibility and NJ, reticulation placement, grafting and merging. |
 | `src/util.rs` | `warn(py, msg)`, `network_error(py, msg)` and friends (they raise the Python-defined exception classes), `py_float_repr`, `deepcopy`, `type_name`, `coerce_unit`. |
 | `tests/` | The upstream suite, copied verbatim. It is the contract: `python -m pytest -m "not slow"` must stay at 1349 passed / 24 skipped. |
+
+## What stays in Python
+
+The search drivers (`MetropolisHastings`, `State`, `ModelGraph`, `MCMC_GT`,
+`MCMC_SEQ`, `InferNetwork_ML`, `infer_dimple`), the `infer`/`score`
+registry and engines, the data containers (`MSA`, `Matrix`, `Alphabet`,
+`PopulationGenetics`, the dataclasses), multiprocessing, printing and
+plotting, and `Validation.py` (file validators over BioPython / python-nexus)
+are deliberately Python: they are orchestration, not computation. Every
+numerical kernel, graph algorithm, parser, simulator and proposal operator
+they call runs in `phynetpy._core`.
 
 ## Build and test
 
@@ -34,7 +47,8 @@ export VIRTUAL_ENV="$PWD/.venv"      # maturin installs into this venv
 
 A bare `cargo build` without `VIRTUAL_ENV` fails at link time (it finds the
 x86 Anaconda Python); `cargo check` is fine for type errors. `cargo test`
-runs the pure-Rust unit tests.
+runs the pure-Rust unit tests and also needs `VIRTUAL_ENV` (and, to be safe,
+`PYO3_PYTHON=$PWD/.venv/bin/python`) set so the test binary links.
 
 ## Conventions
 

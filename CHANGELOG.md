@@ -6,6 +6,57 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.8.0] -- Unreleased
+
+### Changed -- the computational core is now Rust
+
+- The package is a Python front over the compiled extension `phynetpy._core`
+  (PyO3, one `abi3` wheel per platform for Python 3.9+). The public API,
+  module names, classes, functions, signatures and docstrings are unchanged;
+  every module that held computation is now a facade over Rust. Seeded runs
+  reproduce the 0.7.0 results: the operators, simulators and samplers draw
+  from the caller's `numpy.random.Generator` (or `random`) in the same order
+  as before, and the test suite passes unchanged (1349 tests, plus the slow
+  MCMC recovery runs). The suite runs in about 12 s instead of 45 s.
+- Ported to Rust: `Network`, `Node`, `Edge`, transactions and the graph
+  algorithms (`GraphUtils`); the Newick parser and `IO` (Newick, NEXUS,
+  FASTA, VCF readers and writers, standard detection and conversion) and
+  the NEXUS alignment reader behind `MSA`; the MSC/MSNC coalescent dynamic
+  programmes, the MPL triplet pseudo-likelihood, the sequence likelihood and
+  `GTR` substitution models, the biallelic-marker (SNP) likelihood, the
+  allopolyploid parsimony scorer, chain diagnostics and the bounded Brent
+  line search; the network proposal moves; the `MCMC_GT` likelihood engine,
+  priors and displayed trees; the `MCMC_SEQ` priors, UPGMA starting trees
+  and all proposal operators; the `GeneTrees` analysis routines (mappings,
+  cluster and split support, RF distance, consensus, concordance factors,
+  duplication-loss); `ReticulationComparison` and `JointDissimilarity`;
+  the Yule, birth-death, gene-tree, sequence and SNP marker simulators; and
+  the DIMPLE compute stages (partitioning, restriction, compatibility and
+  constrained NJ, reticulation placement, grafting and merging).
+- Still Python by design: the search drivers and samplers' control loops,
+  `infer`/`score` and the registry, the data containers, multiprocessing,
+  printing and plotting, and `Validation`.
+- `networkx`, `scipy` and `scikit-learn` are no longer used; `biopython`
+  and `python-nexus` are only imported by `Validation`. SciPy's
+  `linear_sum_assignment` and NetworkX's `find_cliques` are reimplemented
+  with identical tie-breaking.
+- Installing from source needs a Rust toolchain; wheels do not.
+
+### Fixed
+
+- `MSA(filename=...)` on a NEXUS file with `datatype=standard` returns the
+  codings as tokens instead of failing inside BioPython, and a malformed
+  TREES block ahead of the DATA block no longer aborts reading the
+  alignment. A missing file raises `FileNotFoundError`.
+- The DIMPLE and MCMC_SEQ ports guard a few loops the reference could spin
+  on forever (a reticulation cycle in `_sim_seq`, gamma reflection at
+  exactly 0) by raising or declining the proposal instead.
+- Results that depended on Python's hash-randomised set iteration in
+  `GeneTrees` (consensus child order, `support_on_reference` key order) are
+  now deterministic.
+
+---
+
 ## [0.7.0] -- 2026-10-30
 
 ### Added -- DIMPLE: divide-and-conquer inference on a tree of blobs

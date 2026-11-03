@@ -44,6 +44,14 @@ is Yu and Nakhleh's triplet pseudo-likelihood, already implemented by
 The entry point is :func:`infer_dimple`. It is not a cell of the
 ``(data, model, criterion)`` registry: the partition and the stitch are
 specific to this pipeline.
+
+The graph, combinatorial and numerical steps (partitioning, gene-tree
+restriction, displayed-tree selection, the compatibility filter,
+constrained neighbor-joining, reticulation records and placement, prune
+reattachment, grafting and the per-blob merge) run in the compiled core
+(``phynetpy._core``, the ``_dp_*`` functions). This module keeps the
+records, the input checks, the subset-search orchestration and the
+driver, and every name below keeps its signature.
 """
 
 from __future__ import annotations
@@ -52,31 +60,20 @@ import math
 import random
 import time
 import warnings
-from collections import Counter
 from dataclasses import dataclass, field, replace
-from itertools import product
 from typing import Callable, Optional, Sequence
 
-import networkx as nx
 import numpy as np
 
 from .criteria import PseudoLikelihood
 from .data import GeneTrees
-from .GraphUtils import (
-    add_hybrid,
-    count_reticulations,
-    get_all_subtrees,
-    group_reticulations,
-    induced_subnetwork_by_taxa,
-    is_tree,
-    reticulation_signature,
-    rooted_triples,
-)
+from .GraphUtils import count_reticulations, is_tree
 from .models import MSC
 from .ModelSelection import reticulation_sweep
-from .Network import Edge, Network, NetworkError, Node
+from .Network import Edge, Network, Node
 from ._mcmc_gt import _populate_default_branch_lengths
 from ._units import BranchLengthUnit
+from . import _core
 
 # A near-duplicate of a reticulation already accepted has to clear this
 # relative gain. Any strict gain is enough for a placement that is not near
@@ -320,9 +317,7 @@ class GraftPiece:
 
 def _labels(net: Network, node: Optional[Node] = None) -> frozenset[str]:
     """Leaf labels of ``net``, or of the clade under ``node``."""
-    if node is None:
-        return frozenset(leaf.label for leaf in net.get_leaves())
-    return frozenset(leaf.label for leaf in net.leaf_descendants(node))
+    return _core._dp_labels(net, node)
 
 
 def _label_map(net: Network) -> dict[Node, frozenset[str]]:
@@ -332,44 +327,27 @@ def _label_map(net: Network) -> dict[Node, frozenset[str]]:
     need the leaf set of every node; one ``leaf_descendants_all`` is far
     cheaper than a ``leaf_descendants`` per node.
     """
-    return {
-        node: frozenset(leaf.label for leaf in leaves)
-        for node, leaves in net.leaf_descendants_all().items()
-    }
+    return _core._dp_label_map(net)
 
 
 def _copy(net: Network) -> Network:
     """A structural copy of ``net``."""
-    return net.copy()[0]
+    return _core._dp_copy(net)
 
 
 def _blobs(net: Network) -> list[Node]:
     """Polytomies: nodes with more than two children. Not biconnected components."""
-    return [node for node in net.V() if net.out_degree(node) > 2]
+    return _core._dp_blobs(net)
 
 
 def _is_binary_tree(net: Network) -> bool:
     """A rooted tree in which every internal node has exactly two children."""
-    if not net.is_acyclic():
-        return False
-    for node in net.V():
-        if net.in_degree(node) > 1 or node.is_reticulation():
-            return False
-        out = net.out_degree(node)
-        if out == 0:
-            continue
-        if out != 2:
-            return False
-    return True
+    return _core._dp_is_binary_tree(net)
 
 
 def _node_with_leaves(net: Network, leaves: frozenset[str]) -> Optional[Node]:
     """The node whose descendant leaf set is exactly ``leaves``, if there is one."""
-    target = frozenset(leaves)
-    for node, below in _label_map(net).items():
-        if below == target:
-            return node
-    return None
+    return _core._dp_node_with_leaves(net, leaves)
 
 
 def _below_retics(net: Network, node: Node) -> Node:
@@ -378,13 +356,7 @@ def _below_retics(net: Network, node: Node) -> Node:
     A pruned clade attached at a reticulation has to land inside the hybrid
     clade. Each reticulation has one child; stop when the node is not one.
     """
-    current = node
-    while net.in_degree(current) > 1:
-        children = net.get_children(current)
-        if len(children) != 1:
-            break
-        current = children[0]
-    return current
+    return _core._dp_below_retics(net, node)
 
 
 def _detach(net: Network, parent: Node, child: Node) -> Network:
@@ -405,17 +377,7 @@ def _detach(net: Network, parent: Node, child: Node) -> Network:
     Raises:
         NetworkError: If a leaf under ``child`` cannot be induced.
     """
-    # Capture the clade before the cut so the returned network does not
-    # share nodes with ``net``.
-    clade = induced_subnetwork_by_taxa(net, sorted(_labels(net, child)))
-    doomed = list(net.get_subtree_at(child))
-    net.remove_edge(net.get_edge(parent, child))
-    for node in doomed:
-        if node in net.V():
-            net.remove_nodes(node)
-    # The cut leaves a degree-2 chain between the parent and its surviving child.
-    net.clean(_CONTRACT_DEGREE2)
-    return clade
+    return _core._dp_detach(net, parent, child)
 
 
 def strip_outgroup(net: Network, outgroup: Optional[str]) -> Network:
@@ -431,18 +393,7 @@ def strip_outgroup(net: Network, outgroup: Optional[str]) -> Network:
     Returns:
         Network: Scaffold on the remaining leaves.
     """
-    if outgroup is None or net.has_node_named(outgroup) is None:
-        return _copy(net)
-    keep = [leaf.label for leaf in net.get_leaves() if leaf.label != outgroup]
-    if len(keep) < 3:
-        raise DimpleError(
-            f"Removing outgroup '{outgroup}' leaves fewer than 3 taxa."
-        )
-    # The MRCA of the remaining leaves is the new root, so a root edge that
-    # existed only to hold the outgroup disappears with it.
-    stripped = induced_subnetwork_by_taxa(net, keep)
-    stripped.clean()
-    return stripped
+    return _core._dp_strip_outgroup(net, outgroup)
 
 
 def _ensure_internal_labels(net: Network) -> None:
@@ -455,9 +406,7 @@ def _ensure_internal_labels(net: Network) -> None:
     Args:
         net (Network): Scaffold or blob piece, mutated in place.
     """
-    for node in net.V():
-        if not node.label:
-            net.update_node_name(node, net._fresh_label("B"))
+    _core._dp_ensure_internal_labels(net)
 
 
 # ── Input checks ──────────────────────────────────────────────────────
@@ -529,11 +478,7 @@ def validate_inputs(
 
 def _forbidden(net: Network, blobs: Sequence[Node]) -> set[tuple[str, str]]:
     """Original out-edges of every polytomy, as label pairs. Never cut these."""
-    banned = set()
-    for blob in blobs:
-        for child in net.get_children(blob):
-            banned.add((blob.label, child.label))
-    return banned
+    return _core._dp_forbidden(net, blobs)
 
 
 def _mega_groups(net: Network, blobs: Sequence[Node]) -> list[list[Node]]:
@@ -542,44 +487,12 @@ def _mega_groups(net: Network, blobs: Sequence[Node]) -> list[list[Node]]:
     A polytomy nested inside another through an ordinary node stays its own
     mega-blob. Only an edge from one polytomy to another merges them.
     """
-    parent = {blob.label: blob.label for blob in blobs}
-    by_label = {blob.label: blob for blob in blobs}
-
-    def find(label: str) -> str:
-        """Root of ``label``'s set, with path halving."""
-        while parent[label] != label:
-            parent[label] = parent[parent[label]]
-            label = parent[label]
-        return label
-
-    def union(a: str, b: str) -> None:
-        """Merge the sets of ``a`` and ``b``."""
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-
-    blob_set = set(blobs)
-    for blob in blobs:
-        for child in net.get_children(blob):
-            if child in blob_set:
-                union(blob.label, child.label)
-
-    groups: dict[str, list[Node]] = {}
-    for blob in blobs:
-        groups.setdefault(find(blob.label), []).append(blob)
-    return list(groups.values())
+    return _core._dp_mega_groups(net, blobs)
 
 
 def _top_member(net: Network, members: Sequence[Node]) -> Node:
     """The member no other member is an ancestor of."""
-    member_set = set(members)
-    for blob in members:
-        if not any(
-            other is not blob and blob in net.get_subtree_at(other)
-            for other in member_set
-        ):
-            return blob
-    return members[0]
+    return _core._dp_top_member(net, members)
 
 
 def _candidate_cuts(
@@ -589,33 +502,12 @@ def _candidate_cuts(
     max_subset_size: int,
 ) -> list[tuple[int, Edge]]:
     """Legal cuts: not a polytomy edge, no blob below, both sides at least 3, size at most S."""
-    total = len(net.get_leaves())
-    found = []
-    for edge in net.E():
-        if (edge.src.label, edge.dest.label) in forbidden:
-            continue
-        if edge.src in blob_set:
-            continue
-        # Cutting above a blob would drop that blob out of its allocation.
-        if any(blob in net.get_subtree_at(edge.dest) for blob in blob_set):
-            continue
-        count = len(net.leaf_descendants(edge.dest))
-        if count < 3 or total - count < 3 or count > max_subset_size:
-            continue
-        found.append((count, edge))
-    return found
+    return _core._dp_candidate_cuts(net, forbidden, blob_set, max_subset_size)
 
 
 def _oversized(net: Network, blobs: Sequence[Node], max_subset_size: int) -> list[Node]:
     """Blobs whose children's leaf counts still sum to more than S."""
-    too_big = []
-    for blob in blobs:
-        if blob not in net.V():
-            continue
-        size = sum(len(net.leaf_descendants(child)) for child in net.get_children(blob))
-        if size > max_subset_size:
-            too_big.append(blob)
-    return too_big
+    return _core._dp_oversized(net, blobs, max_subset_size)
 
 
 def _prune_piece(
@@ -641,62 +533,12 @@ def _prune_piece(
     Returns:
         list[PrunedSubtree]: Cuts in the order they were made.
     """
-    pruned: list[PrunedSubtree] = []
-    blob_set = set(blobs)
-    while True:
-        pending = _oversized(net, blobs, max_subset_size)
-        if not pending:
-            break
-        cuts = _candidate_cuts(net, forbidden, blob_set, max_subset_size)
-        if not cuts:
-            break
-        # Largest clade first. Equal sizes break toward the lexicographically
-        # smaller leaf set so the same scaffold always cuts the same edge.
-        cuts.sort(key=lambda item: (-item[0], tuple(sorted(_labels(net, item[1].dest)))))
-        chosen = None
-        for _, edge in cuts:
-            if any(edge.dest in net.get_subtree_at(blob) for blob in pending):
-                chosen = edge
-                break
-        if chosen is None:
-            break
-        parent_leaves = _labels(net, chosen.src)
-        cut_leaves = _labels(net, chosen.dest)
-        siblings = parent_leaves - cut_leaves
-        clade = _detach(net, chosen.src, chosen.dest)
-        pruned.append(PrunedSubtree(
-            leaves=cut_leaves,
-            anchor_leaves=siblings,
-            parent_leaves=parent_leaves,
-            subtree=clade,
-            index=len(pruned),
-        ))
-    return pruned
+    return _core._dp_prune_piece(net, blobs, forbidden, max_subset_size)
 
 
 def _split_clade(net: Network, leaves: frozenset[str], max_subset_size: int) -> list[frozenset[str]]:
     """Split a leaf set larger than S by the same size rules, with no blob edges to protect."""
-    if len(leaves) <= max_subset_size:
-        return [frozenset(leaves)]
-    piece = induced_subnetwork_by_taxa(net, sorted(leaves))
-    parts: list[frozenset[str]] = []
-    # Each iteration removes at least 3 leaves, so this cannot run forever.
-    while len(piece.get_leaves()) > max_subset_size:
-        cuts = _candidate_cuts(piece, set(), set(), max_subset_size)
-        if not cuts:
-            raise DimpleError(
-                f"A clade of {len(piece.get_leaves())} leaves has no legal "
-                f"cut of size at most {max_subset_size}."
-            )
-        cuts.sort(key=lambda item: (-item[0], tuple(sorted(_labels(piece, item[1].dest)))))
-        _, edge = cuts[0]
-        cut_leaves = _labels(piece, edge.dest)
-        _detach(piece, edge.src, edge.dest)
-        parts.append(cut_leaves)
-    rest = _labels(piece)
-    if rest:
-        parts.append(rest)
-    return parts
+    return _core._dp_split_clade(net, leaves, max_subset_size)
 
 
 def _enumerate_partitions(weights: list[int], max_size: int, min_size: int, cap: int = 20000) -> list[list[list[int]]]:
@@ -705,37 +547,7 @@ def _enumerate_partitions(weights: list[int], max_size: int, min_size: int, cap:
     DIMPLE enumerates without a cap; ``cap`` is a safety valve for a blob
     whose items are many and tiny, where the partition count explodes.
     """
-    count = len(weights)
-    results: list[list[list[int]]] = []
-    bins: list[list] = []
-
-    def backtrack(index: int) -> bool:
-        """Place item ``index`` in each open bin, then a new one; True once ``cap`` is hit."""
-        if len(results) >= cap:
-            return True
-        if index == count:
-            if bins and all(bin_[0] >= min_size for bin_ in bins):
-                results.append([list(bin_[1]) for bin_ in bins])
-            return False
-        weight = weights[index]
-        for bin_ in bins:
-            if bin_[0] + weight <= max_size:
-                bin_[0] += weight
-                bin_[1].append(index)
-                if backtrack(index + 1):
-                    bin_[0] -= weight
-                    bin_[1].pop()
-                    return True
-                bin_[0] -= weight
-                bin_[1].pop()
-        bins.append([weight, [index]])
-        stop = backtrack(index + 1)
-        bins.pop()
-        return stop
-
-    if count:
-        backtrack(0)
-    return results
+    return _core._dp_enumerate_partitions(weights, max_size, min_size, cap)
 
 
 def _random_pack(
@@ -755,47 +567,7 @@ def _random_pack(
     This mirrors ``bin_pack_items`` in DIMPLE's divider: ``min_size`` is
     soft, ``max_size`` is hard.
     """
-    order = list(range(len(weights)) if items is None else items)
-    rng.shuffle(order)
-    bins: list[list[int]] = []
-    sizes: list[int] = []
-    for index in order:
-        placed = False
-        for bin_index, size in enumerate(sizes):
-            if size + weights[index] <= max_size:
-                bins[bin_index].append(index)
-                sizes[bin_index] += weights[index]
-                placed = True
-                break
-        if not placed:
-            bins.append([index])
-            sizes.append(weights[index])
-    if len(bins) > 1 and sizes[-1] < min_size:
-        last_size = sizes[-1]
-        for bin_index, size in enumerate(sizes[:-1]):
-            if size + last_size <= max_size:
-                bins[bin_index].extend(bins[-1])
-                sizes[bin_index] += last_size
-                bins.pop()
-                sizes.pop()
-                return bins
-        while sizes[-1] < min_size:
-            movable = [
-                (bin_index, index)
-                for bin_index in range(len(bins) - 1)
-                if sizes[bin_index] > min_size
-                for index in bins[bin_index]
-                if sizes[bin_index] - weights[index] >= min_size
-                and sizes[-1] + weights[index] <= max_size
-            ]
-            if not movable:
-                break
-            bin_index, index = rng.choice(movable)
-            bins[bin_index].remove(index)
-            sizes[bin_index] -= weights[index]
-            bins[-1].append(index)
-            sizes[-1] += weights[index]
-    return bins
+    return _core._dp_random_pack(weights, max_size, min_size, rng, items)
 
 
 def _smallest_first_pack(weights: list[int], max_size: int, min_size: int, rng: random.Random) -> list[list[int]]:
@@ -806,35 +578,12 @@ def _smallest_first_pack(weights: list[int], max_size: int, min_size: int, rng: 
     ``min_size``, every item is packed by :func:`_random_pack` instead.
     ``rng`` only orders the remaining items.
     """
-    order = sorted(range(len(weights)), key=lambda index: weights[index])
-    first: list[int] = []
-    first_size = 0
-    rest: list[int] = []
-    for index in order:
-        if first_size + weights[index] <= max_size:
-            first.append(index)
-            first_size += weights[index]
-        else:
-            rest.append(index)
-    if first_size < min_size:
-        return _random_pack(weights, max_size, min_size, rng)
-    bins = [first] if first else []
-    if rest:
-        bins.extend(_random_pack(weights, max_size, min_size, rng, items=rest))
-    return bins
+    return _core._dp_smallest_first_pack(weights, max_size, min_size, rng)
 
 
 def _bins_to_division(bins: list[list[int]], items: list[tuple[str, frozenset[str]]]) -> list[frozenset[str]]:
     """Turn item-index bins into taxon sets."""
-    division = []
-    for bin_ in bins:
-        leaves: set[str] = set()
-        for index in bin_:
-            leaves |= set(items[index][1])
-        if leaves:
-            division.append(frozenset(leaves))
-    division.sort(key=lambda subset: tuple(sorted(subset)))
-    return division
+    return _core._dp_bins_to_division(bins, items)
 
 
 def _allocations(
@@ -855,69 +604,7 @@ def _allocations(
     in ``[3, S]``, shuffled with ``seed``. If no partition can keep every
     subset at 3 or more, the minimum is relaxed to 1, as DIMPLE does.
     """
-    if not items:
-        return []
-    # Child order in the network is hash order, which is not stable across
-    # parses. Sort so the same leaves always get the same item index.
-    items = sorted(items, key=lambda item: (tuple(sorted(item[1])), item[0]))
-    weights = [len(leaves) for _, leaves in items]
-    if sum(weights) <= max_subset_size:
-        everything: set[str] = set()
-        for _, leaves in items:
-            everything |= set(leaves)
-        return [[frozenset(everything)]]
-
-    min_size = 3
-    chosen: list[list[frozenset[str]]] = []
-    seen: set[frozenset[frozenset[str]]] = set()
-
-    def accept(bins: list[list[int]], floor: int) -> None:
-        """Keep a packing whose subsets all fall in ``[floor, max_subset_size]`` and is new."""
-        division = _bins_to_division(bins, items)
-        if any(len(subset) < floor or len(subset) > max_subset_size for subset in division):
-            return
-        key = frozenset(division)
-        if not key or key in seen:
-            return
-        seen.add(key)
-        chosen.append(division)
-
-    # Phase 1: DIMPLE's K seeded packings. Run 0 is smallest-first, so the
-    # primary division of a scaffold is deterministic.
-    packings: list[list[list[int]]] = []
-    for attempt in range(n_divisions):
-        rng = random.Random(seed + attempt)
-        if attempt == 0:
-            packings.append(_smallest_first_pack(weights, max_subset_size, min_size, rng))
-        else:
-            packings.append(_random_pack(weights, max_subset_size, min_size, rng))
-    for bins in packings:
-        accept(bins, min_size)
-
-    # Phase 2: fill from the enumeration, falling back to a minimum of 1.
-    if len(chosen) < n_divisions and len(items) <= ENUM_MAX_ITEMS:
-        floor = min_size
-        parts = _enumerate_partitions(weights, max_subset_size, min_size)
-        if not parts:
-            floor = 1
-            parts = _enumerate_partitions(weights, max_subset_size, 1)
-        random.Random(seed).shuffle(parts)
-        for bins in parts:
-            if len(chosen) >= n_divisions:
-                break
-            accept(bins, floor)
-
-    # Every packing had an undersized bin and enumeration did not run or
-    # found nothing: keep the packings anyway, as DIMPLE's soft minimum does.
-    if not chosen:
-        for bins in packings:
-            accept(bins, 1)
-    if not chosen:
-        raise DimpleError(
-            "No partition puts every subset in [1, max_subset_size] "
-            f"({max_subset_size})."
-        )
-    return chosen
+    return _core._dp_allocations(items, max_subset_size, n_divisions, seed)
 
 
 def _items_of(
@@ -931,42 +618,7 @@ def _items_of(
     Leaves that belong to a nested blob outside this mega-blob are subtracted.
     A clade still larger than S is split.
     """
-    member_labels = {node.label for node in members}
-    present = [node for node in members if node in net.V()]
-    if not present:
-        return []
-    root = _top_member(net, present)
-    items: list[tuple[str, frozenset[str]]] = []
-
-    def walk(node: Node) -> None:
-        """Descend through this job's polytomies; every other clade is an item."""
-        if node.label in member_labels:
-            for child in net.get_children(node):
-                walk(child)
-            return
-        if node.label in other_blob_labels:
-            return
-        # Another mega-blob can sit inside this child. Its leaves are
-        # allocated on that blob's own job, so they are not an item here.
-        # Membership is by label over every vertex: ``members`` is only
-        # this job's polytomies.
-        leaves = set(_labels(net, node))
-        for other in net.V():
-            if other.label not in other_blob_labels:
-                continue
-            if other is node:
-                leaves.clear()
-                break
-            if other in net.get_subtree_at(node):
-                leaves -= set(_labels(net, other))
-        if not leaves:
-            return
-        for index, part in enumerate(_split_clade(net, frozenset(leaves), max_subset_size)):
-            name = node.label if index == 0 else f"{node.label}:{index}"
-            items.append((name, part))
-
-    walk(root)
-    return items
+    return _core._dp_items_of(net, members, other_blob_labels, max_subset_size)
 
 
 def _classify_prunes(pruned: list[PrunedSubtree], residual: frozenset[str]) -> None:
@@ -979,9 +631,7 @@ def _classify_prunes(pruned: list[PrunedSubtree], residual: frozenset[str]) -> N
         pruned (list[PrunedSubtree]): Cuts just made, mutated in place.
         residual (frozenset[str]): Leaves still in the blob after the cuts.
     """
-    for prune in pruned:
-        if prune.anchor_leaves and not (prune.anchor_leaves & residual):
-            prune.source_type = "prune"
+    _core._dp_classify_prunes(pruned, residual)
 
 
 def partition_scaffold(
@@ -1015,88 +665,9 @@ def partition_scaffold(
         DimpleError: If S or K is illegal, the scaffold is reticulate, or a
             clade cannot be split under the size rules.
     """
-    if max_subset_size < 4:
-        raise DimpleError("max_subset_size must be at least 4.")
-    if n_divisions < 1:
-        raise DimpleError("n_divisions must be at least 1.")
-    for node in net.V():
-        if node.is_reticulation() or net.in_degree(node) > 1:
-            raise DimpleError(
-                "The tree of blobs contains a reticulation. A blob is a "
-                "polytomy on a tree."
-            )
-
-    work = strip_outgroup(net, outgroup)
-    _ensure_internal_labels(work)
-    blobs = _blobs(work)
-    if not blobs:
-        leaves = _labels(work)
-        if len(leaves) > max_subset_size:
-            raise DimpleError(
-                "The scaffold has no polytomy and more leaves than "
-                "max_subset_size."
-            )
-        return [BlobJob(
-            name="tree",
-            tob_leaves=leaves,
-            external_siblings=frozenset(),
-            divisions=[[leaves]] if len(leaves) >= 3 else [],
-            is_root=True,
-        )]
-
-    forbidden = _forbidden(work, blobs)
-    groups = _mega_groups(work, blobs)
-    tops = [_top_member(work, group) for group in groups]
-    jobs: list[BlobJob] = []
-
-    for group, top in zip(groups, tops):
-        member_labels = {node.label for node in group}
-        other_labels = {node.label for node in blobs if node.label not in member_labels}
-        full_leaves = _labels(work, top)
-        parents = work.get_parents(top)
-        if parents:
-            siblings = _labels(work, parents[0]) - full_leaves
-            is_root = False
-        else:
-            siblings = frozenset()
-            is_root = True
-
-        # Nested mega-blobs are allocated on their own. Take them out of this
-        # piece before pruning so a cut cannot swallow them.
-        piece = induced_subnetwork_by_taxa(work, sorted(full_leaves))
-        _ensure_internal_labels(piece)
-        nested = [
-            node for node in piece.V()
-            if node.label in other_labels and piece.out_degree(node) > 2
-        ]
-        for nested_blob in list(nested):
-            if nested_blob not in piece.V():
-                continue
-            nested_parents = piece.get_parents(nested_blob)
-            if not nested_parents:
-                continue
-            _detach(piece, nested_parents[0], nested_blob)
-
-        piece_blobs = [node for node in piece.V() if node.label in member_labels and piece.out_degree(node) > 2]
-        pruned = _prune_piece(piece, piece_blobs, forbidden, max_subset_size)
-        residual = _labels(piece)
-        _classify_prunes(pruned, residual)
-        items = _items_of(piece, set(piece_blobs), other_labels, max_subset_size)
-        if not items and residual:
-            items = [("residual", residual)]
-        divisions = _allocations(items, max_subset_size, n_divisions, seed)
-        jobs.append(BlobJob(
-            name="+".join(sorted(member_labels)),
-            tob_leaves=full_leaves,
-            external_siblings=siblings,
-            divisions=divisions,
-            pruned=pruned,
-            is_root=is_root,
-        ))
-    # Blob discovery follows vertex iteration order, which is not stable
-    # across processes. DIMPLE indexes blobs by sorted mega-blob name.
-    jobs.sort(key=lambda job: job.name)
-    return jobs
+    return _core._dp_partition_scaffold(
+        net, max_subset_size, n_divisions, seed, outgroup,
+    )
 
 
 # ── Subset restriction and inference ──────────────────────────────────
@@ -1122,33 +693,7 @@ def restrict_gene_trees(gene_trees: GeneTrees, taxa: Sequence[str]) -> GeneTrees
     Raises:
         DimpleError: If every gene tree misses the subset.
     """
-    wanted = set(taxa)
-    kept: list[Network] = []
-    for tree in gene_trees.trees:
-        present = [leaf.label for leaf in tree.get_leaves() if leaf.label in wanted]
-        if len(present) < 3:
-            continue
-        if set(present) == {leaf.label for leaf in tree.get_leaves()}:
-            kept.append(tree)
-        else:
-            kept.append(induced_subnetwork_by_taxa(tree, present))
-    if not kept:
-        raise DimpleError(
-            "No gene tree has three taxa in common with the subset "
-            f"{sorted(wanted)}."
-        )
-    remaining = set()
-    for tree in kept:
-        remaining.update(leaf.label for leaf in tree.get_leaves())
-    parent = gene_trees.resolved_mapping()
-    mapping = {
-        species: [allele for allele in alleles if allele in remaining]
-        for species, alleles in parent.items()
-    }
-    mapping = {species: alleles for species, alleles in mapping.items() if alleles}
-    if not mapping:
-        mapping = {label: [label] for label in sorted(remaining)}
-    return GeneTrees(trees=kept, mapping=mapping)
+    return _core._dp_restrict_gene_trees(gene_trees, taxa)
 
 
 def restrict_start(start_tree: Network, taxa: Sequence[str]) -> Network:
@@ -1165,18 +710,7 @@ def restrict_start(start_tree: Network, taxa: Sequence[str]) -> Network:
     Raises:
         DimpleError: If a label is missing, or the induced tree is not binary.
     """
-    missing = [label for label in taxa if start_tree.has_node_named(label) is None]
-    if missing:
-        raise DimpleError(
-            "The start tree is missing subset taxa: "
-            + ", ".join(sorted(missing)[:5]) + "."
-        )
-    induced = induced_subnetwork_by_taxa(start_tree, list(taxa))
-    if not _is_binary_tree(induced):
-        raise DimpleError("The start tree restricted to the subset is not binary.")
-    induced.set_branch_length_unit(BranchLengthUnit.COALESCENT_2N)
-    _populate_default_branch_lengths(induced)
-    return induced
+    return _core._dp_restrict_start(start_tree, taxa)
 
 
 def true_reticulation_bound(true_network: Network, taxa: Sequence[str]) -> int:
@@ -1200,13 +734,7 @@ def true_reticulation_bound(true_network: Network, taxa: Sequence[str]) -> int:
     Raises:
         DimpleError: If a label is not in the true network.
     """
-    missing = [label for label in taxa if true_network.has_node_named(label) is None]
-    if missing:
-        raise DimpleError(
-            "The true network lacks subset taxa: " + ", ".join(sorted(missing)[:5]) + "."
-        )
-    induced = induced_subnetwork_by_taxa(true_network, sorted(taxa))
-    return count_reticulations(induced, min_cycle_size=4)
+    return _core._dp_true_reticulation_bound(true_network, taxa)
 
 
 def _selection_data_size(subset_trees: GeneTrees) -> int:
@@ -1235,13 +763,7 @@ def selection_min_gain(selection: Optional[str], data_size: int) -> float:
     Returns:
         float: The minimum gain.
     """
-    if selection == "gain":
-        return float(SELECTION_GAIN_THRESHOLD)
-    if selection == "aic":
-        return float(SELECTION_PARAMS_PER_RETICULATION)
-    if selection == "bic":
-        return 0.5 * SELECTION_PARAMS_PER_RETICULATION * math.log(max(data_size, 1))
-    return 0.0
+    return _core._dp_selection_min_gain(selection, data_size)
 
 
 def subset_chains(search: dict) -> list[dict]:
@@ -1544,35 +1066,13 @@ def _miss_fraction(
     Lower is better. Fewer than three shared taxa is a total miss. This is
     not an MSC pseudo-likelihood.
     """
-    present = {leaf.label for leaf in tree.get_leaves()}
-    use = present & keep
-    if len(use) < 3:
-        return 1.0
-    viewed = tree if use == present else induced_subnetwork_by_taxa(tree, sorted(use))
-    displayed = rooted_triples(viewed)
-    total = 0
-    matched = 0
-    for (a, b, c), count in observed.items():
-        if a not in use or b not in use or c not in use:
-            continue
-        total += count
-        x, y = (a, b) if a < b else (b, a)
-        if (x, y, c) in displayed:
-            matched += count
-    if total == 0:
-        return 1.0
-    return 1.0 - (matched / total)
+    return _core._dp_miss_fraction(tree, keep, observed)
 
 
 
 def _displayed_tree_choices(net: Network) -> list[dict[Node, Edge]]:
     """The in-edge each tree of :func:`get_all_subtrees` keeps per reticulation, in its order."""
-    retics = sorted((node for node in net.V() if node.is_reticulation()), key=lambda n: n.label)
-    options = [
-        sorted(net.in_edges(node), key=lambda edge: (-(edge.get_gamma() or 0.0), edge.src.label))
-        for node in retics
-    ]
-    return [dict(zip(retics, combo)) for combo in product(*options)]
+    return _core._dp_displayed_tree_choices(net)
 
 
 def select_displayed_trees_with_choices(
@@ -1601,42 +1101,7 @@ def select_displayed_trees_with_choices(
         DimpleError: If a network has several displayed trees and
             ``observed`` is None.
     """
-    leaf_sets = [{leaf.label for leaf in net.get_leaves()} for net in networks]
-    chosen: list[Network] = []
-    choices: list[Optional[dict[Node, Edge]]] = []
-    for index, net in enumerate(networks):
-        if is_tree(net):
-            chosen.append(net)
-            choices.append(None)
-            continue
-        candidates = get_all_subtrees(net)
-        options = _displayed_tree_choices(net)
-        if len(options) != len(candidates):
-            # Not the enumeration this module mirrors; fall back to the major tree.
-            options = [None] * len(candidates)
-        if len(candidates) <= 1:
-            chosen.append(candidates[0] if candidates else net)
-            choices.append(options[0] if options else None)
-            continue
-        if observed is None:
-            raise DimpleError(
-                "Displayed-tree selection needs rooted-triple counts."
-            )
-        others: set[str] = set()
-        for other_index, leaves in enumerate(leaf_sets):
-            if other_index != index:
-                others |= leaves
-        shared = leaf_sets[index] & others
-        best_index = 0
-        best_score = _miss_fraction(candidates[0], shared, observed)
-        for position, candidate in enumerate(candidates[1:], start=1):
-            score = _miss_fraction(candidate, shared, observed)
-            # Strict comparison: an equal score keeps the earlier tree.
-            if score < best_score:
-                best_index = position
-                best_score = score
-        chosen.append(candidates[best_index])
-        choices.append(options[best_index])
+    chosen, choices = _core._dp_select_displayed_trees_with_choices(networks, observed)
     return chosen, choices
 
 
@@ -1673,18 +1138,7 @@ def observed_triples(gene_trees: GeneTrees, taxa: Sequence[str]) -> dict[tuple[s
         dict: ``(a, b, c)`` with ``a < b`` mapped to how many gene trees
         display it.
     """
-    wanted = set(taxa)
-    counts: Counter[tuple[str, str, str]] = Counter()
-    for tree in gene_trees.trees:
-        present = {leaf.label for leaf in tree.get_leaves()} & wanted
-        if len(present) < 3:
-            continue
-        if present != {leaf.label for leaf in tree.get_leaves()}:
-            tree = induced_subnetwork_by_taxa(tree, sorted(present))
-        for triple in rooted_triples(tree):
-            if triple[0] in wanted and triple[1] in wanted and triple[2] in wanted:
-                counts[triple] += 1
-    return dict(counts)
+    return _core._dp_observed_triples(gene_trees, taxa)
 
 
 # ── Compatibility and neighbor-joining ────────────────────────────────
@@ -1692,17 +1146,12 @@ def observed_triples(gene_trees: GeneTrees, taxa: Sequence[str]) -> dict[tuple[s
 
 def _clade_sets(net: Network) -> list[frozenset[str]]:
     """Leaf set of every node of ``net``, computed once per tree."""
-    return list(_label_map(net).values())
+    return _core._dp_clade_sets(net)
 
 
 def _splits(clades: Sequence[frozenset[str]], keep: frozenset[str]) -> list[frozenset[str]]:
     """Nontrivial clades among ``clades`` after restriction to ``keep``."""
-    found = []
-    for clade in clades:
-        below = clade & keep
-        if 2 <= len(below) <= len(keep) - 2:
-            found.append(below)
-    return found
+    return _core._dp_splits(clades, keep)
 
 
 def trees_incompatible(
@@ -1726,25 +1175,7 @@ def trees_incompatible(
     Returns:
         bool: True when the unrooted shapes disagree on the shared labels.
     """
-    if left_clades is None:
-        left_clades = _clade_sets(left)
-    if right_clades is None:
-        right_clades = _clade_sets(right)
-    shared = _labels(left) & _labels(right)
-    if len(shared) < 4:
-        return False
-    for left_split in _splits(left_clades, shared):
-        left_other = shared - left_split
-        for right_split in _splits(right_clades, shared):
-            right_other = shared - right_split
-            if (
-                left_split & right_split
-                and left_split & right_other
-                and left_other & right_split
-                and left_other & right_other
-            ):
-                return True
-    return False
+    return _core._dp_trees_incompatible(left, right, left_clades, right_clades)
 
 
 def greedy_compatible(trees: Sequence[Network]) -> list[Network]:
@@ -1757,15 +1188,7 @@ def greedy_compatible(trees: Sequence[Network]) -> list[Network]:
     Returns:
         list[Network]: The trees that were kept.
     """
-    clades = [_clade_sets(tree) for tree in trees]
-    kept: list[int] = []
-    for index, tree in enumerate(trees):
-        if all(
-            not trees_incompatible(tree, trees[earlier], clades[index], clades[earlier])
-            for earlier in kept
-        ):
-            kept.append(index)
-    return [trees[index] for index in kept]
+    return _core._dp_greedy_compatible(trees)
 
 
 def max_clique_compatible(trees: Sequence[Network]) -> list[Network]:
@@ -1783,210 +1206,22 @@ def max_clique_compatible(trees: Sequence[Network]) -> list[Network]:
     Returns:
         list[Network]: The trees of the largest clique, in input order.
     """
-    if len(trees) <= 1:
-        return list(trees)
-    clades = [_clade_sets(tree) for tree in trees]
-    graph = nx.Graph()
-    graph.add_nodes_from(range(len(trees)))
-    for left in range(len(trees)):
-        for right in range(left + 1, len(trees)):
-            if not trees_incompatible(trees[left], trees[right], clades[left], clades[right]):
-                graph.add_edge(left, right)
-    best = max(nx.find_cliques(graph), key=len, default=[])
-    return [trees[index] for index in sorted(best)]
+    return _core._dp_max_clique_compatible(trees)
 
 
-class _Constraint:
-    """Undirected, degree-2-free tree of current cluster labels.
-
-    A cherry is two labels that share a neighbour. Neighbor-joining may join
-    two labels that both occur in this tree only when they are a cherry.
-    """
-
-    def __init__(self, net: Network) -> None:
-        """Build the constraint from a subset tree.
-
-        Args:
-            net (Network): A tree whose leaves are the cluster labels.
-        """
-        self.leaves: set[str] = set()
-        self.adj: dict[str, set[str]] = {}
-        self.broken: int = 0
-        self._build(net)
-
-    def _build(self, net: Network) -> None:
-        """Copy ``net`` as an undirected graph and suppress every non-leaf of degree <= 2."""
-        names: dict[Node, str] = {}
-        for node in net.V():
-            if net.out_degree(node) == 0:
-                names[node] = node.label
-                self.leaves.add(node.label)
-            else:
-                names[node] = f"u{id(node)}"
-        adj: dict[str, set[str]] = {name: set() for name in names.values()}
-        for edge in net.E():
-            adj[names[edge.src]].add(names[edge.dest])
-            adj[names[edge.dest]].add(names[edge.src])
-        # Suppress non-leaves of degree <= 2 so cherries do not depend on
-        # where the tree was rooted. Restart after each deletion: the
-        # neighbours' degrees change, and ``_suppress`` is the same edit.
-        self.adj = adj
-        changed = True
-        while changed:
-            changed = False
-            for node in list(self.adj):
-                if node in self.leaves or len(self.adj[node]) > 2:
-                    continue
-                self._suppress(node)
-                changed = True
-                break
-
-    def cherries(self) -> set[frozenset[str]]:
-        """Pairs of labels that currently share a neighbour.
-
-        Returns:
-            set[frozenset[str]]: Every unordered pair of leaves that is a cherry.
-        """
-        pairs: set[frozenset[str]] = set()
-        if len(self.leaves) == 2:
-            pairs.add(frozenset(self.leaves))
-        for node, neighbours in self.adj.items():
-            leaf_neighbours = [item for item in neighbours if item in self.leaves]
-            if node in self.leaves:
-                for leaf in leaf_neighbours:
-                    pairs.add(frozenset((node, leaf)))
-            else:
-                for i in range(len(leaf_neighbours)):
-                    for j in range(i + 1, len(leaf_neighbours)):
-                        pairs.add(frozenset((leaf_neighbours[i], leaf_neighbours[j])))
-        return pairs
-
-    def _suppress(self, node: str) -> None:
-        """Splice out a non-leaf of degree 2, or delete one of degree <= 1."""
-        neighbours = self.adj.get(node)
-        if neighbours is None or node in self.leaves:
-            return
-        if len(neighbours) == 2:
-            left, right = tuple(neighbours)
-            self.adj[left].discard(node)
-            self.adj[right].discard(node)
-            self.adj[left].add(right)
-            self.adj[right].add(left)
-            del self.adj[node]
-        elif len(neighbours) <= 1:
-            for neighbour in list(neighbours):
-                self.adj[neighbour].discard(node)
-            del self.adj[node]
-
-    def rename(self, old: str, new: str) -> None:
-        """Replace a leaf label. Used when only one side of a join is in this tree.
-
-        Args:
-            old (str): The leaf to relabel; ignored when absent.
-            new (str): Its new label.
-        """
-        if old not in self.leaves:
-            return
-        neighbours = self.adj.pop(old)
-        self.adj[new] = set(neighbours)
-        for neighbour in neighbours:
-            self.adj[neighbour].discard(old)
-            self.adj[neighbour].add(new)
-        self.leaves.discard(old)
-        self.leaves.add(new)
-
-    def remove_leaf(self, label: str) -> None:
-        """Delete a leaf and suppress the internal node it leaves behind.
-
-        Args:
-            label (str): Leaf to drop. A label that is not a leaf is ignored.
-        """
-        if label not in self.leaves:
-            return
-        neighbours = self.adj.pop(label)
-        self.leaves.discard(label)
-        for neighbour in neighbours:
-            self.adj[neighbour].discard(label)
-        # Sorted so suppression does not follow set order.
-        for neighbour in sorted(neighbours):
-            self._suppress(neighbour)
-
-    def contract(self, left: str, right: str, new: str) -> bool:
-        """Replace a cherry with ``new``. Return False when the pair is not a cherry.
-
-        Args:
-            left (str): One leaf of the proposed cherry.
-            right (str): The other leaf.
-            new (str): Label that replaces the cherry.
-
-        Returns:
-            bool: True when the pair was a cherry and was replaced.
-        """
-        shared = self.adj.get(left, set()) & self.adj.get(right, set())
-        if shared:
-            parent = next(iter(shared))
-            self.adj[parent].discard(left)
-            self.adj[parent].discard(right)
-            del self.adj[left]
-            del self.adj[right]
-            self.leaves.discard(left)
-            self.leaves.discard(right)
-            self.adj[new] = {parent}
-            self.adj[parent].add(new)
-            self.leaves.add(new)
-            self._suppress(parent)
-            return True
-        # The two labels became directly adjacent (a two-leaf tree).
-        if right in self.adj.get(left, set()):
-            del self.adj[left]
-            del self.adj[right]
-            self.leaves.discard(left)
-            self.leaves.discard(right)
-            self.adj[new] = set()
-            self.leaves.add(new)
-            return True
-        return False
-
-    def join(self, left: str, right: str, new: str) -> None:
-        """Apply a neighbor-joining cluster merge to this constraint.
-
-        A pair that is in this tree but is not a cherry is a relaxed join.
-        Both leaves are deleted and ``new`` is not added: that cluster is
-        unconstrained here, and the other leaves keep their splits.
-
-        Args:
-            left (str): One cluster label.
-            right (str): The other cluster label.
-            new (str): Label of the joined cluster.
-        """
-        has_left = left in self.leaves
-        has_right = right in self.leaves
-        if has_left and has_right:
-            if not self.contract(left, right, new):
-                self.remove_leaf(left)
-                self.remove_leaf(right)
-                self.broken += 1
-        elif has_left:
-            self.rename(left, new)
-        elif has_right:
-            self.rename(right, new)
+# The neighbor-joining constraint tree lives in the Rust core; the class
+# keeps its name and interface (leaves, adj, broken, cherries, join, ...).
+_Constraint = _core._Constraint
 
 
 def _leaf_network(label: str) -> Network:
     """A one-node network whose only node is the leaf ``label``."""
-    net = Network()
-    net.add_nodes(Node(label))
-    return net
+    return _core._dp_leaf_network(label)
 
 
 def _join_clusters(left: Network, right: Network) -> Network:
     """A new root with ``left`` and ``right`` as its two clades."""
-    joined = Network()
-    root = Node(joined._fresh_label("J"))
-    joined.add_nodes(root)
-    joined.graft_subtree(left, under=root)
-    joined.graft_subtree(right, under=root)
-    return joined
+    return _core._dp_join_clusters(left, right)
 
 
 def _distance(dist: dict[tuple[str, str], float], left: str, right: str) -> float:
@@ -2009,24 +1244,7 @@ def _reverse_upward(net: Network, start: Node, ignore: Optional[Node] = None) ->
         ignore (Node | None): Parent to skip. The new root, when the edge
             into ``start`` was just replaced.
     """
-    # Record the path before any edge is flipped. Reversing while walking
-    # would follow the edge that was just turned around.
-    chain: list[tuple[Node, Node]] = []
-    current = start
-    seen: set[Node] = set()
-    while current not in seen:
-        seen.add(current)
-        parents = [parent for parent in net.get_parents(current) if parent is not ignore]
-        if not parents:
-            break
-        parent = parents[0]
-        chain.append((parent, current))
-        current = parent
-    for parent, child in chain:
-        edge = net.get_edge(parent, child)
-        length = edge.get_length()
-        net.remove_edge(edge)
-        net.add_edges(Edge(child, parent, length=length))
+    _core._dp_reverse_upward(net, start, ignore)
 
 
 def _reroot_on_edge(net: Network, parent: Node, child: Node) -> None:
@@ -2037,20 +1255,7 @@ def _reroot_on_edge(net: Network, parent: Node, child: Node) -> None:
         parent (Node): Source of the edge that becomes the root edge.
         child (Node): Destination of that edge.
     """
-    edge = net.get_edge(parent, child)
-    length = edge.get_length()
-    net.remove_edge(edge)
-    root = Node(net._fresh_label("R"))
-    net.add_nodes(root)
-    # The new root sits halfway along the old edge, so the path length
-    # between the old parent and child is unchanged.
-    half = None if length is None else length / 2.0
-    net.add_edges([
-        Edge(root, child, length=half),
-        Edge(root, parent, length=half),
-    ])
-    _reverse_upward(net, parent, ignore=root)
-    net.clean()
+    _core._dp_reroot_on_edge(net, parent, child)
 
 
 def _reroot_above(net: Network, label: str) -> None:
@@ -2064,23 +1269,12 @@ def _reroot_above(net: Network, label: str) -> None:
         net (Network): Tree mutated in place.
         label (str): Leaf whose parent becomes the root.
     """
-    leaf = net.has_node_named(label)
-    if leaf is None:
-        return
-    parents = net.get_parents(leaf)
-    if not parents:
-        return
-    _reverse_upward(net, parents[0])
+    _core._dp_reroot_above(net, label)
 
 
 def _smaller_side(net: Network, child: Node) -> tuple[str, ...]:
     """Sorted labels of the smaller side of the edge into ``child``."""
-    below = tuple(sorted(_labels(net, child)))
-    universe = tuple(sorted(leaf.label for leaf in net.get_leaves()))
-    complement = tuple(label for label in universe if label not in set(below))
-    if (len(below), below) <= (len(complement), complement):
-        return below
-    return complement
+    return _core._dp_smaller_side(net, child)
 
 
 def _root_by_triples(
@@ -2101,35 +1295,7 @@ def _root_by_triples(
     Returns:
         Network: The chosen rooting.
     """
-    if not counts or not any(counts.values()):
-        return tree
-    n_leaves = len(tree.get_leaves())
-    if n_leaves > 60:
-        warnings.warn(
-            f"Rooting a {n_leaves}-leaf blob by rooted triples scores every edge.",
-            stacklevel=2,
-        )
-    root = tree.root()
-    under_root = sorted(tree.out_edges(root), key=lambda edge: edge.dest.label)
-    skip = set(under_root[1:])
-    best_score = 0
-    best_side: tuple[str, ...] = ()
-    best_copy: Optional[Network] = None
-    for edge in tree.E():
-        if edge in skip:
-            continue
-        side = _smaller_side(tree, edge.dest)
-        copy, mapping = tree.copy()
-        _reroot_on_edge(copy, mapping[edge.src], mapping[edge.dest])
-        displayed = rooted_triples(copy)
-        score = sum(counts.get(triple, 0) for triple in displayed)
-        if best_copy is None or score > best_score or (score == best_score and side < best_side):
-            best_score = score
-            best_side = side
-            best_copy = copy
-    if best_copy is None or best_score == 0:
-        return tree
-    return best_copy
+    return _core._dp_root_by_triples(tree, counts)
 
 
 def overlap_nj(
@@ -2166,97 +1332,7 @@ def overlap_nj(
         DimpleError: If a distance the merge needs is undefined, or the
             outgroup distances do not cover ``labels``.
     """
-    names = list(labels)
-    if len(names) == 0:
-        raise DimpleError("Neighbor-joining was given no taxa.")
-    if len(names) == 1:
-        return _leaf_network(names[0]), 0
-    if matrix.shape != (len(names), len(names)):
-        raise DimpleError("Distance matrix shape does not match the taxon list.")
-    if not np.isfinite(matrix).all():
-        raise DimpleError(
-            "A taxon pair this blob needs never co-occurs in a gene tree."
-        )
-
-    dist: dict[tuple[str, str], float] = {}
-    for i, left in enumerate(names):
-        for j, right in enumerate(names):
-            if i < j:
-                dist[(left, right)] = dist[(right, left)] = float(matrix[i, j])
-
-    if outgroup_distances is not None:
-        missing = [name for name in names if name not in outgroup_distances]
-        if missing:
-            raise DimpleError(
-                "Outgroup distances are missing for " + ", ".join(missing[:5]) + "."
-            )
-        for name in names:
-            value = float(outgroup_distances[name])
-            dist[(name, _OUT)] = dist[(_OUT, name)] = value
-        names.append(_OUT)
-
-    constraints = [_Constraint(tree) for tree in trees]
-    clusters = {name: _leaf_network(name) for name in names}
-    active = list(names)
-    relaxations = 0
-    counter = 0
-
-    while len(active) > 1:
-        count = len(active)
-        row_sum = {
-            label: sum(_distance(dist, label, other) for other in active if other != label)
-            for label in active
-        }
-        pairs = []
-        for i, left in enumerate(active):
-            for right in active[i + 1:]:
-                # Saitou and Nei (1987): smallest Q is the next join.
-                # Label order only breaks ties.
-                q_value = (count - 2) * _distance(dist, left, right) - row_sum[left] - row_sum[right]
-                pairs.append((q_value, left, right))
-        pairs.sort(key=lambda item: (item[0], item[1], item[2]))
-
-        def violates(left: str, right: str) -> bool:
-            """True when some subset tree holds both labels but not as a cherry."""
-            for constraint in constraints:
-                if left in constraint.leaves and right in constraint.leaves:
-                    if frozenset((left, right)) not in constraint.cherries():
-                        return True
-            return False
-
-        chosen = None
-        for _, left, right in pairs:
-            if not violates(left, right):
-                chosen = (left, right)
-                break
-        if chosen is None:
-            # Every legal pair is blocked. Take the best Q pair and record it.
-            relaxations += 1
-            chosen = (pairs[0][1], pairs[0][2])
-        left, right = chosen
-        new_label = f"NJ{counter}"
-        counter += 1
-        for other in active:
-            if other == left or other == right:
-                continue
-            updated = 0.5 * (
-                _distance(dist, left, other)
-                + _distance(dist, right, other)
-                - _distance(dist, left, right)
-            )
-            dist[(new_label, other)] = dist[(other, new_label)] = updated
-        for constraint in constraints:
-            constraint.join(left, right, new_label)
-        clusters[new_label] = _join_clusters(clusters[left], clusters[right])
-        active = [label for label in active if label != left and label != right]
-        active.append(new_label)
-
-    merged = clusters[active[0]]
-    if merged.has_node_named(_OUT) is not None:
-        _reroot_above(merged, _OUT)
-        merged.remove_nodes(merged.has_node_named(_OUT))
-        merged.clean()
-    return merged, relaxations
+    return _core._dp_overlap_nj(trees, labels, matrix, outgroup_distances)
 
 
 def _leaf_path_lengths(tree: Network, wanted: set[str]) -> dict[tuple[str, str], float]:
@@ -2273,36 +1349,7 @@ def _leaf_path_lengths(tree: Network, wanted: set[str]) -> dict[tuple[str, str],
     Returns:
         dict[tuple[str, str], float]: ``(a, b)`` with ``a < b`` to the path length.
     """
-    root = next(node for node in tree.V() if tree.in_degree(node) == 0)
-    order: list[Node] = []
-    stack: list[tuple[Node, bool]] = [(root, False)]
-    while stack:
-        node, done = stack.pop()
-        if done:
-            order.append(node)
-            continue
-        stack.append((node, True))
-        for child in tree.get_children(node):
-            stack.append((child, False))
-    below: dict[Node, dict[str, float]] = {}
-    lengths: dict[tuple[str, str], float] = {}
-    for node in order:
-        children = tree.get_children(node)
-        if not children:
-            below[node] = {node.label: 0.0} if node.label in wanted else {}
-            continue
-        merged: dict[str, float] = {}
-        for child in children:
-            length = tree.get_edge(node, child).get_length()
-            length = 1.0 if length is None else float(length)
-            lifted = {label: dist + length for label, dist in below.pop(child).items()}
-            for left, left_dist in merged.items():
-                for right, right_dist in lifted.items():
-                    key = (left, right) if left < right else (right, left)
-                    lengths[key] = left_dist + right_dist
-            merged.update(lifted)
-        below[node] = merged
-    return lengths
+    return _core._dp_leaf_path_lengths(tree, wanted)
 
 
 def gene_tree_distance_matrix(
@@ -2333,32 +1380,7 @@ def gene_tree_distance_matrix(
     Raises:
         DimpleError: If ``strict`` and some pair never co-occurs.
     """
-    labels = sorted(set(taxa))
-    index = {label: position for position, label in enumerate(labels)}
-    wanted = set(labels)
-    size = len(labels)
-    total = np.zeros((size, size))
-    counts = np.zeros((size, size))
-    for tree in gene_trees.trees:
-        present = {leaf.label for leaf in tree.get_leaves()} & wanted
-        if len(present) < 2:
-            continue
-        for (left, right), distance in _leaf_path_lengths(tree, wanted).items():
-            i, j = index[left], index[right]
-            total[i, j] += distance
-            total[j, i] += distance
-            counts[i, j] += 1
-            counts[j, i] += 1
-    never = (counts == 0) & ~np.eye(size, dtype=bool)
-    if strict and np.any(never):
-        raise DimpleError(
-            f"{int(np.sum(never)) // 2} taxon pair(s) never co-occur in a "
-            "gene tree; their distance is undefined."
-        )
-    matrix = total / np.maximum(counts, 1)
-    matrix[never] = np.nan
-    np.fill_diagonal(matrix, 0.0)
-    return labels, matrix
+    return _core._dp_gene_tree_distance_matrix(gene_trees, taxa, strict)
 
 
 def _outgroup_distances(
@@ -2388,18 +1410,7 @@ def _outgroup_distances(
         dict[str, float]: Outgroup distance for each blob taxon that has
         a finite distance to every sibling.
     """
-    index = {label: position for position, label in enumerate(matrix_labels)}
-    sibs = [label for label in siblings if label in index]
-    distances = {}
-    for label in labels:
-        if label not in index or not sibs:
-            continue
-        row = index[label]
-        values = [matrix[row, index[sibling]] for sibling in sibs]
-        if values and np.isfinite(values).all():
-            factor = OUTGROUP_SCALE if scale is None else scale
-            distances[label] = factor * float(np.mean(values))
-    return distances
+    return _core._dp_outgroup_distances(labels, matrix_labels, matrix, siblings, scale)
 
 
 # ── Reticulation placement ────────────────────────────────────────────
@@ -2413,15 +1424,7 @@ def _major_edges(net: Network) -> dict[Node, Edge]:
     :func:`phynetpy.GraphUtils.get_all_subtrees` enumerates, so its first
     tree keeps exactly these edges.
     """
-    kept: dict[Node, Edge] = {}
-    for node in net.V():
-        if net.in_degree(node) < 2:
-            continue
-        incoming = sorted(
-            net.in_edges(node), key=lambda edge: (-(edge.get_gamma() or 0.0), edge.src.label),
-        )
-        kept[node] = incoming[0]
-    return kept
+    return _core._dp_major_edges(net)
 
 
 def _view(net: Network, drop: Sequence[Edge]) -> tuple[Network, dict[Node, Node]]:
@@ -2432,17 +1435,7 @@ def _view(net: Network, drop: Sequence[Edge]) -> tuple[Network, dict[Node, Node]
     chains are kept, so a surviving node of ``net`` is still found through
     the returned map; a removed node is simply absent from the view.
     """
-    view, node_map = net.copy()
-    leaves = {leaf.label for leaf in net.get_leaves()}
-    for edge in drop:
-        view.remove_edge([node_map[edge.src], node_map[edge.dest]])
-    pruning = True
-    while pruning:
-        pruning = False
-        for node in list(view.V()):
-            if view.out_degree(node) == 0 and node.label not in leaves:
-                view.remove_nodes(node)
-                pruning = True
+    view, node_map = _core._dp_view(net, list(drop))
     return view, node_map
 
 
@@ -2468,37 +1461,13 @@ def _attachment_leaves(
     inserted, the edges above the clade form a chain, and the height says
     which link this edge belongs on.
     """
-    view, node_map = _view(net, drop)
-    present = set(view.V())
-    node = start
-    while node_map[node] not in present:
-        if net.in_degree(node) >= 2 and node in kept:
-            node = kept[node].src
-        else:
-            parents = net.get_parents(node)
-            if not parents:
-                return frozenset(), 0
-            node = parents[0]
-    anchor = node_map[node]
-    height = 0
-    current = anchor
-    while view.out_degree(current) == 1:
-        current = view.get_children(current)[0]
-        if view.out_degree(current) == 1:
-            height += 1
-    return _labels(view, anchor) & taxa, height
+    leaves, height = _core._dp_attachment_leaves(net, kept, list(drop), start, taxa)
+    return leaves, height
 
 
 def _chain_depth(net: Network, node: Node) -> int:
     """Reticulations stacked directly under ``node``, each the other's only child."""
-    depth = 0
-    current = node
-    while True:
-        children = net.get_children(current)
-        if len(children) != 1 or net.in_degree(children[0]) < 2:
-            return depth
-        depth += 1
-        current = children[0]
+    return _core._dp_chain_depth(net, node)
 
 
 def reticulation_records(net: Network, kept: Optional[dict[Node, Edge]] = None) -> list[dict]:
@@ -2535,57 +1504,7 @@ def reticulation_records(net: Network, kept: Optional[dict[Node, Edge]] = None) 
         list[dict]: Records carrying ``signature``, leaf sets, gammas and
         ``retic_depth``, in label order of the reticulation node.
     """
-    reference = _major_edges(net)
-    if kept:
-        reference.update({node: edge for node, edge in kept.items() if node in reference})
-    records = []
-    taxa = _labels(net)
-    retics = sorted((node for node in net.V() if net.in_degree(node) == 2), key=lambda n: n.label)
-    for node in retics:
-        incoming = list(net.in_edges(node))
-        # Higher gamma is the major parent. Equal gammas break by label.
-        incoming.sort(key=lambda edge: (-(edge.get_gamma() or 0.0), edge.src.label))
-        major_edge, minor_edge = incoming
-        # The other reticulations as the displayed tree shows them; this
-        # one keeps both parents so its own sides can be read. A chain of
-        # reticulations directly below it hangs from it here, whatever the
-        # displayed tree kept: otherwise this node has no child clade at all.
-        local = dict(reference)
-        current = node
-        while True:
-            children = net.get_children(current)
-            if len(children) != 1 or net.in_degree(children[0]) < 2:
-                break
-            local[children[0]] = net.get_edge(current, children[0])
-            current = children[0]
-        others = [
-            edge
-            for other, kept_edge in local.items() if other is not node
-            for edge in net.in_edges(other) if edge is not kept_edge
-        ]
-        base, base_map = _view(net, others)
-        if base_map[node] not in set(base.V()):
-            # Nothing of the displayed tree hangs below this reticulation.
-            continue
-        kept_side, kept_height = _attachment_leaves(
-            net, local, others + [major_edge], major_edge.src, taxa,
-        )
-        minor_side, minor_height = _attachment_leaves(
-            net, local, others + [minor_edge], minor_edge.src, taxa,
-        )
-        records.append({
-            "signature": reticulation_signature(base, base_map[node]),
-            "retic_leaves": _labels(base, base_map[node]),
-            "kept_sibling_leaves": kept_side,
-            "minor_sibling_leaves": minor_side,
-            "kept_height": kept_height,
-            "minor_height": minor_height,
-            "major_gamma": float(major_edge.get_gamma() or 0.0),
-            "minor_gamma": float(minor_edge.get_gamma() or 0.0),
-            "network_taxa": taxa,
-            "retic_depth": _chain_depth(net, node),
-        })
-    return records
+    return _core._dp_reticulation_records(net, kept)
 
 
 def collect_reticulation_candidates(
@@ -2612,41 +1531,12 @@ def collect_reticulation_candidates(
     Returns:
         list[dict]: Records from :func:`reticulation_records`, one per event.
     """
-    records = [
-        record
-        for index, net in enumerate(networks)
-        for record in reticulation_records(net, references[index] if references else None)
-    ]
-    representatives = [
-        max(group, key=lambda record: len(record["retic_leaves"]))
-        for group in group_reticulations(records)
-    ]
-    found = []
-    seen = set()
-    for record in representatives:
-        key = (
-            frozenset(record["network_taxa"]),
-            frozenset(record["retic_leaves"]),
-            frozenset(record["minor_sibling_leaves"]),
-            frozenset(record["kept_sibling_leaves"]),
-            round(record["major_gamma"], 6),
-            round(record["minor_gamma"], 6),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        found.append(record)
-    return found
+    return _core._dp_collect_reticulation_candidates(networks, references)
 
 
 def _mrca_or_none(net: Network, leaves: frozenset[str]) -> Optional[Node]:
     """MRCA of ``leaves``, or None when a label is absent."""
-    if not leaves or any(net.has_node_named(label) is None for label in leaves):
-        return None
-    try:
-        return net.mrca(set(leaves))
-    except NetworkError:
-        return None
+    return _core._dp_mrca_or_none(net, leaves)
 
 
 def _clade_node(net: Network, leaves: frozenset[str]) -> Optional[Node]:
@@ -2664,10 +1554,7 @@ def _clade_node(net: Network, leaves: frozenset[str]) -> Optional[Node]:
         Node | None: The clade node, the MRCA, or None when a label is
         absent or the MRCA cannot be computed.
     """
-    node = _node_with_leaves(net, leaves)
-    if node is not None:
-        return node
-    return _mrca_or_none(net, leaves)
+    return _core._dp_clade_node(net, leaves)
 
 
 def _child_clade(net: Network, record: dict) -> Optional[Node]:
@@ -2685,11 +1572,7 @@ def _child_clade(net: Network, record: dict) -> Optional[Node]:
         Node | None: The clade node, or None when the leaves are not a clade
         on the source network's taxa.
     """
-    node = _mrca_or_none(net, record["retic_leaves"])
-    if node is None:
-        return None
-    below = _labels(net, node) & frozenset(record["network_taxa"])
-    return node if below == record["retic_leaves"] else None
+    return _core._dp_child_clade(net, record)
 
 
 def _side_leaves(
@@ -2699,11 +1582,7 @@ def _side_leaves(
     taxa: set[str] | frozenset[str],
 ) -> set[str]:
     """Leaves beside ``child`` under ``parent``, restricted to ``taxa``."""
-    current: set[str] = set()
-    for sibling in net.get_children(parent):
-        if sibling is not child:
-            current |= set(_labels(net, sibling))
-    return current & taxa
+    return _core._dp_side_leaves(net, child, parent, taxa)
 
 
 def choose_inserted_side(net: Network, record: dict) -> frozenset[str]:
@@ -2722,41 +1601,7 @@ def choose_inserted_side(net: Network, record: dict) -> frozenset[str]:
     Returns:
         frozenset[str]: The side that should be inserted.
     """
-    minor = record["minor_sibling_leaves"]
-    kept = record["kept_sibling_leaves"]
-    child = _child_clade(net, record)
-    if child is None:
-        return minor
-    parents = net.get_parents(child)
-    if not parents or not kept:
-        return minor
-    taxa = set(record["network_taxa"])
-    decided: Optional[frozenset[str]] = None
-    best = -1.0
-    for parent in sorted(parents, key=lambda node: node.label):
-        current = _side_leaves(net, child, parent, taxa)
-        if not current:
-            continue
-        # ``current`` is the sibling set this parent already holds. Insert
-        # the recorded side it does not match. A proper subset is decisive;
-        # otherwise the higher Jaccard overlap is the side already held.
-        # The choice is the record's own frozenset, so ``is`` still tells
-        # the major side from the minor side.
-        if current <= minor and not current <= kept:
-            quality, choice = 1.0, kept
-        elif current <= kept and not current <= minor:
-            quality, choice = 1.0, minor
-        else:
-            kept_overlap = len(current & kept) / max(len(current | kept), 1)
-            minor_overlap = len(current & minor) / max(len(current | minor), 1)
-            if kept_overlap >= minor_overlap:
-                quality, choice = kept_overlap, minor
-            else:
-                quality, choice = minor_overlap, kept
-        if quality > best:
-            best = quality
-            decided = choice
-    return decided if decided is not None else minor
+    return _core._dp_choose_inserted_side(net, record)
 
 
 def _destination_edge(
@@ -2779,18 +1624,7 @@ def _destination_edge(
     Returns:
         Edge | None: The edge to split as the hybrid's destination.
     """
-    incoming = list(net.in_edges(child))
-    if not incoming:
-        return None
-    if len(incoming) == 1:
-        return incoming[0]
-
-    def match(edge: Edge) -> tuple[int, str]:
-        """Rank an in-edge by how many held leaves sit on its side, then by label."""
-        covered = _side_leaves(net, child, edge.src, taxa)
-        return (len(covered & held), edge.src.label)
-
-    return max(incoming, key=match)
+    return _core._dp_destination_edge(net, child, held, taxa)
 
 
 def candidate_edges(net: Network, record: dict) -> list[Edge]:
@@ -2809,71 +1643,12 @@ def candidate_edges(net: Network, record: dict) -> list[Edge]:
         list[Edge]: Candidate source edges, best match first. Empty when
         nothing on the tree carries the target leaves.
     """
-    child = _child_clade(net, record)
-    if child is None:
-        return []
-    target = choose_inserted_side(net, record)
-    excluded = net.get_subtree_at(child)
-    taxa = set(record["network_taxa"])
-    labels = _label_map(net)
-    exact: list[Edge] = []
-    partial: list[tuple[int, str, Edge]] = []
-    for edge in net.E():
-        if edge.dest in excluded:
-            continue
-        covered = labels[edge.dest] & taxa
-        if not covered or not covered <= target:
-            continue
-        # The destination of the hybrid edit is the edge above the child.
-        # Offering that same edge as the source would build a bubble.
-        if edge.dest is child:
-            continue
-        if covered == target:
-            exact.append(edge)
-        else:
-            partial.append((len(covered), "".join(sorted(covered)), edge))
-    if exact:
-        # Exact matches with one clade below them form a chain of edges above
-        # it (the positions of hybrid edges already inserted). The source
-        # network says which link this edge belongs on; that one is tried
-        # first, so an equal score keeps it, and the rest follow bottom-up.
-        # Edge sets iterate in memory order, so the order is fixed by depth
-        # and label rather than left to the process.
-        depth: dict[Node, int] = {}
-        frontier = [(root, 0) for root in net.roots()]
-        while frontier:
-            node, level = frontier.pop()
-            if node in depth:
-                continue
-            depth[node] = level
-            frontier.extend((child, level + 1) for child in net.get_children(node))
-        exact.sort(key=lambda edge: (-depth.get(edge.dest, 0), edge.src.label, edge.dest.label))
-        height = record.get("kept_height" if target is record["kept_sibling_leaves"] else "minor_height", 0)
-        if 0 < height < len(exact):
-            exact.insert(0, exact.pop(height))
-        return exact
-    partial.sort(key=lambda item: (-item[0], item[1]))
-    return [edge for _, _, edge in partial]
+    return _core._dp_candidate_edges(net, record)
 
 
 def _edge_distance(net: Network, start: Node, goal: Node, limit: int = 2) -> int:
     """Undirected distance between two nodes, or ``limit + 1`` when farther."""
-    if start is goal:
-        return 0
-    seen = {start}
-    frontier = [start]
-    for distance in range(1, limit + 1):
-        nxt = []
-        for node in frontier:
-            neighbours = list(net.get_children(node)) + list(net.get_parents(node))
-            for neighbour in neighbours:
-                if neighbour is goal:
-                    return distance
-                if neighbour not in seen:
-                    seen.add(neighbour)
-                    nxt.append(neighbour)
-        frontier = nxt
-    return limit + 1
+    return _core._dp_edge_distance(net, start, goal, limit)
 
 
 def _sort_records(records: list[dict], net: Network) -> list[dict]:
@@ -2883,41 +1658,7 @@ def _sort_records(records: list[dict], net: Network) -> list[dict]:
     :func:`_placement_view`). An upper reticulation of a chain also goes
     before the lower one.
     """
-    # Place i before j when i's child leaves meet j's inserted side. The
-    # outer edge is only a clade after the inner hybrid is in. Kahn order;
-    # a cycle falls through and keeps the input order.
-    sides = [choose_inserted_side(net, record) for record in records]
-    count = len(records)
-    dependencies = [set() for _ in range(count)]
-    for i in range(count):
-        child = records[i]["retic_leaves"]
-        for j in range(count):
-            if i == j:
-                continue
-            if child & sides[j]:
-                dependencies[j].add(i)
-            # Stacked reticulations share a child clade; the upper one goes
-            # first, so the lower one is inserted into the edge below it.
-            if child & records[j]["retic_leaves"] and (
-                records[i].get("retic_depth", 0) > records[j].get("retic_depth", 0)
-            ):
-                dependencies[j].add(i)
-    indegree = [len(deps) for deps in dependencies]
-    queue = [index for index in range(count) if indegree[index] == 0]
-    order: list[int] = []
-    while queue:
-        index = queue.pop(0)
-        order.append(index)
-        for other in range(count):
-            if index in dependencies[other]:
-                dependencies[other].discard(index)
-                indegree[other] -= 1
-                if indegree[other] == 0:
-                    queue.append(other)
-    for index in range(count):
-        if index not in order:
-            order.append(index)
-    return [records[index] for index in order]
+    return _core._dp_sort_records(records, net)
 
 
 def _insert_hybrid(
@@ -2947,30 +1688,10 @@ def _insert_hybrid(
         tuple[str, str]: Labels of the new hybrid edge's source node and of
         the reticulation node, which name the inserted edge on any copy.
     """
-    dest_gamma = destination.get_gamma() if destination.dest.is_reticulation() else None
-    src_gamma = source.get_gamma() if source.dest.is_reticulation() else None
-    dest_child_retic = destination.dest.is_reticulation()
-    src_child_retic = source.dest.is_reticulation()
-    before = {node.label for node in net.V()}
-    add_hybrid(net, source, destination)
-    created = [node for node in net.V() if node.label not in before]
-    retic = next(node for node in created if node.is_reticulation())
-    minor = next(node for node in created if node is not retic)
-    for edge in net.in_edges(retic):
-        if edge.src is minor:
-            edge.set_gamma(minor_gamma)
-        else:
-            edge.set_gamma(major_gamma)
-    # 0.0 is a real inheritance probability. Only a missing gamma is skipped.
-    if dest_child_retic and dest_gamma is not None:
-        for edge in net.out_edges(retic):
-            edge.set_gamma(dest_gamma)
-    if src_child_retic and src_gamma is not None:
-        for edge in net.out_edges(minor):
-            if edge.dest is not retic:
-                edge.set_gamma(src_gamma)
-    _populate_default_branch_lengths(net)
-    return minor.label, retic.label
+    minor_label, retic_label = _core._dp_insert_hybrid(
+        net, source, destination, major_gamma, minor_gamma,
+    )
+    return minor_label, retic_label
 
 
 
@@ -2985,22 +1706,12 @@ def _placement_view(net: Network, inserted: set[tuple[str, str]]) -> Network:
     itself is returned while nothing has been inserted; a pre-existing
     reticulation of the input backbone is part of the view.
     """
-    if not inserted:
-        return net
-    drop = [edge for edge in net.E() if (edge.src.label, edge.dest.label) in inserted]
-    return _view(net, drop)[0]
+    return _core._dp_placement_view(net, inserted)
 
 
 def _edge_by_labels(net: Network, edge: Edge) -> Optional[Edge]:
     """The edge of ``net`` between the nodes named like ``edge``'s endpoints, or None."""
-    src = net.has_node_named(edge.src.label)
-    dest = net.has_node_named(edge.dest.label)
-    if src is None or dest is None:
-        return None
-    try:
-        return net.get_edge(src, dest)
-    except (AssertionError, NetworkError, KeyError):
-        return None
+    return _core._dp_edge_by_labels(net, edge)
 
 
 def place_reticulations(
@@ -3045,115 +1756,10 @@ def place_reticulations(
     Raises:
         RuntimeError: If ``score_fn`` on the starting tree is not finite.
     """
-    current = tree
-    base = float(score_fn(current))
-    if not math.isfinite(base):
-        raise RuntimeError(
-            f"Pseudo-likelihood of the base tree is not finite ({base})."
-        )
-    records = collect_reticulation_candidates(networks, references)
-    # (source label, reticulation label) of every hybrid edge placed here.
-    inserted: set[tuple[str, str]] = set()
-    view = _placement_view(current, inserted)
-    pending = _sort_records(records, view)
-    trials: list[ReticTrial] = []
-    # Child-leaf sets of accepted reticulations. A Node from the network
-    # that was just copied is not in the next graph, so the set is resolved
-    # again on ``current`` whenever a later candidate is scored.
-    accepted: list[frozenset[str]] = []
-    score = base
-
-    while pending:
-        record = pending.pop(0)
-        child = record["retic_leaves"]
-        child_node = _child_clade(view, record)
-        if child_node is None:
-            trials.append(ReticTrial(
-                child, frozenset(), False, score, score, reason="child_not_clade",
-            ))
-            continue
-        edges = candidate_edges(view, record)
-        # The view hides the hybrid edges placed so far, so an edge may hang
-        # below the child through one of them without being in its view
-        # subtree. A source edge below the child would close a directed
-        # cycle; reachability is the full network's.
-        anchor = current.has_node_named(child_node.label)
-        if anchor is not None:
-            below = {node.label for node in current.get_subtree_at(anchor)}
-            edges = [edge for edge in edges if edge.dest.label not in below]
-        if not edges:
-            trials.append(ReticTrial(
-                child, frozenset(), False, score, score, reason="no_candidate_edge",
-            ))
-            continue
-        side = choose_inserted_side(view, record)
-        # The side being inserted is the major side exactly when the backbone
-        # kept the minor parent. The gammas follow that side, not the names.
-        if side is record["kept_sibling_leaves"]:
-            major_gamma, minor_gamma = record["minor_gamma"], record["major_gamma"]
-            held = record["minor_sibling_leaves"]
-        else:
-            major_gamma, minor_gamma = record["major_gamma"], record["minor_gamma"]
-            held = record["kept_sibling_leaves"]
-        destination = _destination_edge(
-            view, child_node, held, set(record["network_taxa"]),
-        )
-        if destination is None:
-            trials.append(ReticTrial(
-                child, frozenset(), False, score, score, reason="no_destination",
-            ))
-            continue
-
-        best_score = -math.inf
-        best_trial: Optional[Network] = None
-        best_edge_leaves: frozenset[str] = frozenset()
-        best_near = False
-        best_pair: Optional[tuple[str, str]] = None
-        for edge in edges:
-            if edge is destination:
-                continue
-            trial, _ = current.copy()
-            source = _edge_by_labels(trial, edge)
-            dest = _edge_by_labels(trial, destination)
-            if source is None or dest is None:
-                continue
-            if source is dest or source.src is dest.src and source.dest is dest.dest:
-                # Same edge: add_hybrid would build a bubble. Not a candidate.
-                continue
-            pair = _insert_hybrid(trial, source, dest, major_gamma, minor_gamma)
-            if not trial.is_acyclic():
-                continue
-            trial_score = float(score_fn(trial))
-            if trial_score > best_score:
-                best_score = trial_score
-                best_trial = trial
-                best_pair = pair
-                best_edge_leaves = _labels(view, edge.dest)
-                anchor = current.has_node_named(edge.dest.label)
-                best_near = anchor is not None and _near_accepted(current, anchor, child, accepted)
-
-        threshold = REDUNDANCY_THRESHOLD if best_near else 0.0
-        gain = best_score - score
-        relative = gain / abs(score) if score != 0 else gain
-        keep = (
-            best_trial is not None
-            and math.isfinite(best_score)
-            and best_score > score + min_gain
-            and relative >= threshold
-        )
-        trials.append(ReticTrial(
-            child, best_edge_leaves, keep, score, best_score if math.isfinite(best_score) else score,
-        ))
-        if keep and best_trial is not None:
-            current = best_trial
-            score = best_score
-            accepted.append(child)
-            if best_pair is not None:
-                inserted.add(best_pair)
-            view = _placement_view(current, inserted)
-            if pending:
-                pending = _sort_records(pending, view)
-    return current, trials
+    network, trials = _core._dp_place_reticulations(
+        tree, networks, score_fn, min_gain, references,
+    )
+    return network, trials
 
 
 def _near_accepted(
@@ -3167,21 +1773,7 @@ def _near_accepted(
     Accepted events are leaf sets. Each one is resolved on ``net``, which is
     the graph ``anchor`` belongs to.
     """
-    for existing in accepted:
-        if not (child & existing):
-            continue
-        retic = _mrca_or_none(net, existing)
-        if retic is not None and _edge_distance(net, anchor, retic) <= 2:
-            return True
-    labels = None
-    for node in net.V():
-        if net.in_degree(node) < 2:
-            continue
-        if labels is None:
-            labels = _label_map(net)
-        if child & labels[node] and _edge_distance(net, anchor, node) <= 2:
-            return True
-    return False
+    return _core._dp_near_accepted(net, anchor, child, accepted)
 
 
 # ── Prune reattachment ────────────────────────────────────────────────
@@ -3189,21 +1781,7 @@ def _near_accepted(
 
 def _attachment_rank(scaffold: Optional[Network], prune: PrunedSubtree) -> tuple:
     """Higher means closer to the anchor, and therefore attached later (inner)."""
-    if scaffold is None or not prune.anchor_leaves or not prune.parent_leaves:
-        return (0, 0, prune.index)
-    parent = _clade_node(scaffold, prune.parent_leaves)
-    anchor = _mrca_or_none(scaffold, prune.anchor_leaves)
-    if parent is None or anchor is None:
-        return (0, 0, prune.index)
-    try:
-        common = scaffold.mrca({parent, anchor})
-    except NetworkError:
-        return (0, 0, prune.index)
-    return (
-        scaffold.dist_from_root(common),
-        scaffold.dist_from_root(parent),
-        prune.index,
-    )
+    return _core._dp_attachment_rank(scaffold, prune)
 
 
 def _place_stuck_prune(
@@ -3233,44 +1811,8 @@ def _place_stuck_prune(
     Raises:
         DimpleError: If no host shares a leaf with any waiting anchor.
     """
-    blob_labels = set(_labels(net))
-    best_count = 0
-    best: Optional[tuple[PrunedSubtree, Optional[PrunedSubtree]]] = None
-    for prune in waiting:
-        hosts: list[tuple[Optional[PrunedSubtree], set[str]]] = [(None, blob_labels)]
-        hosts.extend(
-            (other, set(_labels(other.subtree)))
-            for other in waiting if other is not prune
-        )
-        for host, labels in hosts:
-            count = len(set(prune.anchor_leaves) & labels)
-            if count > best_count:
-                best_count = count
-                best = (prune, host)
-    if best is None:
-        raise DimpleError(
-            f"{len(waiting)} pruned subtree(s) could not be attached: no host "
-            "shares a leaf with their anchors."
-        )
-    prune, host = best
-    if host is None:
-        available = frozenset(set(prune.anchor_leaves) & blob_labels)
-        anchor = _mrca_or_none(net, available)
-        if anchor is None:
-            raise DimpleError("A stuck pruned subtree has no MRCA on the blob.")
-        net = attach(prune, net, anchor)
-        return net, [other for other in waiting if other is not prune]
-    host_tree = _copy(host.subtree)
-    available = frozenset(set(prune.anchor_leaves) & set(_labels(host_tree)))
-    anchor = _mrca_or_none(host_tree, available)
-    if anchor is None:
-        raise DimpleError("A stuck pruned subtree has no MRCA on its host clade.")
-    host_tree = attach(prune, host_tree, anchor)
-    carried = replace(host, subtree=host_tree)
-    return net, [
-        carried if other is host else other
-        for other in waiting if other is not prune
-    ]
+    net, waiting = _core._dp_place_stuck_prune(net, list(waiting), attach)
+    return net, waiting
 
 
 def reattach_prunes(
@@ -3303,68 +1845,7 @@ def reattach_prunes(
         DimpleError: If a clade cannot be attached, or its anchor is empty
             or disjoint from the blob when it was supposed to land there.
     """
-    net = _copy(blob)
-    if not prunes:
-        return net
-    # A leaf that inference put in the blob and that a prune also owns would
-    # be duplicated. Drop it from the blob; the prune brings it back.
-    overlap = _labels(net) & set().union(*(set(prune.leaves) for prune in prunes))
-    for label in overlap:
-        node = net.has_node_named(label)
-        if node is not None:
-            net.remove_nodes(node)
-    net.clean()
-    initial = _labels(net)
-    ordered = sorted(prunes, key=lambda prune: _attachment_rank(scaffold, prune))
-    remaining = list(ordered)
-
-    def attach(prune: PrunedSubtree, host: Network, anchor: Node) -> Network:
-        """Graft ``prune`` as the sibling of ``anchor`` (moved below any reticulation chain)."""
-        anchor = _below_retics(host, anchor)
-        # graft_subtree returns the image and, when anchor is the root,
-        # builds a new root so the clade is not dropped.
-        host.graft_subtree(prune.subtree, sibling_of=anchor)
-        return host
-
-    while remaining:
-        progress = False
-        waiting: list[PrunedSubtree] = []
-        for prune in remaining:
-            if not prune.anchor_leaves:
-                raise DimpleError(
-                    "A pruned subtree has an empty anchor. The division "
-                    "must record the cut's siblings."
-                )
-            if prune.source_type == "blob_item":
-                if not (set(prune.anchor_leaves) & set(initial)):
-                    raise DimpleError(
-                        "A pruned subtree's anchor shares no leaf with the "
-                        "blob, so it cannot be attached."
-                    )
-                # DIMPLE anchors a blob-item cut on the blob's own leaves,
-                # not on leaves another prune has brought back since.
-                target = set(prune.anchor_leaves) & set(initial)
-                anchor = _mrca_or_none(net, frozenset(target))
-                if anchor is None:
-                    waiting.append(prune)
-                    continue
-                net = attach(prune, net, anchor)
-                progress = True
-                continue
-            # source_type == "prune": every anchor leaf must already be back.
-            if not set(prune.anchor_leaves) <= set(_labels(net)):
-                waiting.append(prune)
-                continue
-            anchor = _mrca_or_none(net, prune.anchor_leaves)
-            if anchor is None:
-                waiting.append(prune)
-                continue
-            net = attach(prune, net, anchor)
-            progress = True
-        if not progress:
-            net, waiting = _place_stuck_prune(net, waiting, attach)
-        remaining = waiting
-    return net
+    return _core._dp_reattach_prunes(blob, prunes, scaffold)
 
 
 # ── Scaffold graft ────────────────────────────────────────────────────
@@ -3372,17 +1853,7 @@ def reattach_prunes(
 
 def _remove_clade(net: Network, leaves: frozenset[str]) -> None:
     """Delete the clade whose leaf set is ``leaves``, then contract degree-2 nodes."""
-    node = _node_with_leaves(net, leaves)
-    if node is None:
-        return
-    parents = net.get_parents(node)
-    doomed = list(net.get_subtree_at(node))
-    if parents:
-        net.remove_edge(net.get_edge(parents[0], node))
-    for item in doomed:
-        if item in net.V():
-            net.remove_nodes(item)
-    net.clean(_CONTRACT_DEGREE2)
+    _core._dp_remove_clade(net, leaves)
 
 
 def _rehang_inner(result: Network, graft_root: Node, saved: list[GraftPiece]) -> None:
@@ -3401,28 +1872,7 @@ def _rehang_inner(result: Network, graft_root: Node, saved: list[GraftPiece]) ->
         saved (list[GraftPiece]): Inner blobs that were inside the replaced
             clade.
     """
-    remaining = list(saved)
-    while remaining:
-        present = set(_labels(result))
-        remaining.sort(key=lambda inner: -len(set(inner.anchor_leaves) & present))
-        inner = remaining.pop(0)
-        available = frozenset(set(inner.anchor_leaves) & present)
-        anchor = _mrca_or_none(result, available) if available else None
-        if anchor is not None:
-            result.graft_subtree(
-                inner.network, sibling_of=_below_retics(result, anchor),
-            )
-            continue
-        children = result.get_children(graft_root) if graft_root in result.V() else []
-        if children:
-            result.graft_subtree(inner.network, sibling_of=_below_retics(result, children[0]))
-        elif graft_root in result.V():
-            result.graft_subtree(inner.network, under=graft_root)
-        else:
-            raise DimpleError(
-                "An inner blob has no anchor leaf on the outer blob and the "
-                "graft root is gone, so it cannot be reattached."
-            )
+    _core._dp_rehang_inner(result, graft_root, saved)
 
 
 def graft_blobs(scaffold: Network, pieces: Sequence[GraftPiece]) -> Network:
@@ -3446,72 +1896,7 @@ def graft_blobs(scaffold: Network, pieces: Sequence[GraftPiece]) -> Network:
         DimpleError: If a piece repeats a leaf that is still on the scaffold,
             or its clade cannot be found.
     """
-    result = _copy(scaffold)
-
-    def depth_of(leaves: frozenset[str]) -> int:
-        """Root distance of the scaffold node holding exactly ``leaves``; 0 when absent."""
-        node = _clade_node(scaffold, leaves)
-        if node is None:
-            return 0
-        return scaffold.dist_from_root(node)
-
-    ordered = sorted(pieces, key=lambda piece: -depth_of(piece.tob_leaves))
-    placed: list[GraftPiece] = []
-    for piece in ordered:
-        node = _clade_node(result, piece.tob_leaves)
-        if node is None:
-            raise DimpleError(
-                "No scaffold clade has the leaves of blob "
-                f"{sorted(piece.tob_leaves)[:5]}."
-            )
-        saved = [
-            earlier for earlier in placed
-            if earlier.tob_leaves < piece.tob_leaves
-            and _node_with_leaves(result, earlier.tob_leaves) is not None
-            and _node_with_leaves(result, earlier.tob_leaves) in result.get_subtree_at(node)
-        ]
-        for earlier in saved:
-            _remove_clade(result, earlier.tob_leaves)
-        # The outer node may have moved if a removal contracted a degree-2
-        # chain. Find whatever still holds the remaining outer leaves.
-        remaining = _labels(result, node) if node in result.V() else frozenset()
-        if node not in result.V() or not remaining:
-            node = _node_with_leaves(result, piece.tob_leaves - set().union(
-                *(set(item.tob_leaves) for item in saved)
-            ) if saved else piece.tob_leaves)
-        if node is None:
-            raise DimpleError("The blob clade disappeared while detaching an inner graft.")
-        parents = result.get_parents(node)
-        parent = parents[0] if parents else None
-        doomed = list(result.get_subtree_at(node))
-        if parent is not None:
-            result.remove_edge(result.get_edge(parent, node))
-        for item in doomed:
-            if item in result.V():
-                result.remove_nodes(item)
-        if parent is None and len(result.V()) == 0:
-            result = _copy(piece.network)
-            graft_root = next(
-                vertex for vertex in result.V() if result.in_degree(vertex) == 0
-            )
-        else:
-            if parent is None:
-                raise DimpleError(
-                    "Replacing the root left other nodes behind. The blob "
-                    "does not cover the scaffold."
-                )
-            # Leaves of the piece must not still be somewhere else.
-            collision = _labels(piece.network) & _labels(result)
-            if collision:
-                sample = ", ".join(sorted(collision)[:5])
-                raise DimpleError(
-                    f"Grafting would duplicate taxa already on the scaffold: {sample}."
-                )
-            graft_root = result.graft_subtree(piece.network, under=parent)
-        _rehang_inner(result, graft_root, saved)
-        placed.append(piece)
-    result.clean(_CONTRACT_DEGREE2)
-    return result
+    return _core._dp_graft_blobs(scaffold, pieces)
 
 
 # ── Per-blob merge ────────────────────────────────────────────────────
@@ -3609,80 +1994,11 @@ def merge_blob_networks(
         tuple[Network, int, list[ReticTrial]]: Merged tree-plus-reticulations,
         neighbor-joining relaxations, and reticulation trials.
     """
-    taxa: set[str] = set()
-    for net in networks:
-        taxa |= set(_labels(net))
-    if len(networks) == 1 and set(required_taxa) <= taxa:
-        return networks[0], 0, []
-    taxa |= set(required_taxa)
-    # One restriction to the blob serves the triple counts and the scorer.
-    # The distance matrix reads the full trees: it also needs the siblings.
-    blob_trees = restrict_gene_trees(gene_trees, sorted(taxa))
-    counts = observed_triples(blob_trees, sorted(taxa))
-    if backbone is not None:
-        if frozenset(_labels(backbone)) != frozenset(taxa):
-            raise DimpleError("The supplied backbone is not on the blob's taxa.")
-        merged = _copy(backbone)
-        if trace is not None:
-            trace["displayed"] = []
-            trace["compatible"] = []
-            trace["backbone"] = _copy(merged)
-            trace["candidates"] = collect_reticulation_candidates(networks)
-        scorer = _msc_scorer(blob_trees, frozenset(sorted(taxa)))
-        min_gain = 0.0
-        if model_selection in ("gain", "aic", "bic"):
-            min_gain = selection_min_gain(model_selection, _selection_data_size(blob_trees))
-        with_retics, trials = place_reticulations(merged, networks, scorer, min_gain=min_gain)
-        return with_retics, 0, trials
-    references: Optional[list[Optional[dict[Node, Edge]]]] = None
-    if tree_sources is not None:
-        displayed = list(tree_sources)
-    else:
-        displayed, references = select_displayed_trees_with_choices(networks, counts)
-    # DIMPLE's default filter keeps the largest clique of pairwise
-    # compatible trees, not the first-fit subset.
-    compatible = max_clique_compatible(displayed)
-    assert compatible, "max_clique_compatible returned no trees"
-    if trace is not None:
-        trace["displayed"] = displayed
-        trace["compatible"] = compatible
-    needed = taxa | set(external_siblings)
-    # Sibling–sibling pairs are not read. A missing one must not fail the
-    # matrix; blob–blob pairs are checked in overlap_nj, and a blob taxon
-    # with no finite sibling distance fails when the outgroup is placed.
-    labels, matrix = gene_tree_distance_matrix(gene_trees, sorted(needed), strict=False)
-    index = {label: position for position, label in enumerate(labels)}
-    blob_labels = [label for label in labels if label in taxa]
-    positions = [index[label] for label in blob_labels]
-    submatrix = matrix[np.ix_(positions, positions)]
-    outgroup = None
-    if external_siblings:
-        outgroup = _outgroup_distances(blob_labels, labels, matrix, external_siblings)
-        if any(label not in outgroup for label in blob_labels):
-            raise DimpleError(
-                "Cannot place the virtual outgroup: a blob taxon has no "
-                "distance to the scaffold siblings."
-            )
-    # Taxa that survived in no constraint tree are still required. They are
-    # unconstrained leaves of the distance matrix, not dropped.
-    merged, relaxations = overlap_nj(
-        compatible, blob_labels, submatrix, outgroup_distances=outgroup,
+    merged, relaxations, trials = _core._dp_merge_blob_networks(
+        networks, gene_trees, external_siblings, required_taxa,
+        model_selection, trace, tree_sources, backbone,
     )
-    # No scaffold sister: NJ's last join is not a root. Pick the edge whose
-    # rooting displays the most observed triples.
-    if outgroup is None:
-        merged = _root_by_triples(merged, counts)
-    if trace is not None:
-        trace["backbone"] = _copy(merged)
-        trace["candidates"] = collect_reticulation_candidates(networks, references)
-    scorer = _msc_scorer(blob_trees, frozenset(blob_labels))
-    min_gain = 0.0
-    if model_selection in ("gain", "aic", "bic"):
-        min_gain = selection_min_gain(model_selection, _selection_data_size(blob_trees))
-    with_retics, trials = place_reticulations(
-        merged, networks, scorer, min_gain=min_gain, references=references,
-    )
-    return with_retics, relaxations, trials
+    return merged, relaxations, trials
 
 
 # ── Entry point ───────────────────────────────────────────────────────

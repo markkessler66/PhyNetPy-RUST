@@ -274,7 +274,7 @@ fn cpython_set_order(hashes: &[u64]) -> Vec<usize> {
 
 /// The in-edges of ``uid`` in the order the reference saw them: the
 /// Python set ``Network.in_edges`` returns, built in in-edge order.
-fn in_edges_in_set_order(py: Python<'_>, net: &Network, uid: u64) -> Vec<u64> {
+pub(crate) fn in_edges_in_set_order(py: Python<'_>, net: &Network, uid: u64) -> Vec<u64> {
     let edges = net.in_edge_uids(uid);
     let hashes: Vec<u64> = edges.iter().map(|e| net.edges[e].obj.borrow(py).hash).collect();
     cpython_set_order(&hashes).into_iter().map(|i| edges[i]).collect()
@@ -838,7 +838,7 @@ fn ancestor_depths(net: &Network, start: u64) -> IndexMap<u64, usize, FxBuildHas
     dist
 }
 
-fn reticulation_cycle_size_impl(net: &Network, retic: u64) -> usize {
+pub(crate) fn reticulation_cycle_size_impl(net: &Network, retic: u64) -> usize {
     let parents = net.parents(retic);
     if parents.len() < 2 {
         return 0;
@@ -1320,7 +1320,7 @@ fn tree_of_blobs<'py>(py: Python<'py>, net: &Bound<'py, Network>) -> PyResult<Bo
 
 #[pyfunction]
 #[pyo3(name = "_gu_level")]
-fn level(py: Python<'_>, net: &Bound<'_, Network>) -> usize {
+pub(crate) fn level(py: Python<'_>, net: &Bound<'_, Network>) -> usize {
     let this = net.borrow();
     if this.nodes.is_empty() {
         return 0;

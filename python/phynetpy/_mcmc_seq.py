@@ -41,6 +41,16 @@ verified to match PhyloNet bit-for-bit -- lives in
 * the public :class:`MCMC_SEQ` driver, mirroring the surface of
   :class:`phynetpy._mcmc_gt.MCMC_GT`.
 
+The priors, the UPGMA starting trees, the height bookkeeping and every
+proposal operator (including the coupled gene-tree re-proposals and the
+posterior summaries) are implemented in the compiled core
+(``phynetpy._core``, ``src/search/mcmc_seq.rs``); this module keeps the
+dataclasses, the per-locus likelihood cache, :class:`SeqState`, the kernel's
+operator dispatch and the chain drivers, and re-exports every operator as a
+thin facade with its original signature.  Operators still return
+``(log_hastings_ratio, undo)``; ``undo`` is a callable handle that swaps the
+captured pre-move objects back into the state.
+
 Units & defaults follow PhyloNet exactly: heights/branch lengths are in
 expected substitutions per site, ``theta = 4 N mu`` (per-pair coalescent rate
 ``2/theta``), the default substitution model is JC69, the default population
@@ -66,6 +76,7 @@ from typing import Any, Callable, Optional, Sequence
 import numpy as np
 
 from .Network import Network, Node, Edge
+from . import _core
 from ._units import (
     _positive_theta,
     BranchLengthUnit,
@@ -214,22 +225,12 @@ class MCMCSeqPriors:
 
 def _log_poisson_pmf(k: int, mean: float) -> float:
     """Log of the Poisson(``mean``) pmf at ``k``."""
-    if mean <= 0.0:
-        return 0.0 if k == 0 else float("-inf")
-    return k * math.log(mean) - mean - math.lgamma(k + 1)
+    return _core._seq_log_poisson_pmf(k, mean)
 
 
 def _log_gamma_pdf(x: float, shape: float, mean: float) -> float:
     """Log density of a Gamma distribution parameterised by shape + mean."""
-    if x <= 0.0:
-        return float("-inf")
-    scale = mean / shape
-    return (
-        (shape - 1.0) * math.log(x)
-        - x / scale
-        - shape * math.log(scale)
-        - math.lgamma(shape)
-    )
+    return _core._seq_log_gamma_pdf(x, shape, mean)
 
 
 def _log_beta_pdf(x: float, alpha: float, beta: float) -> float:
@@ -239,17 +240,7 @@ def _log_beta_pdf(x: float, alpha: float, beta: float) -> float:
     density genuinely vanishes there -- which for ``alpha, beta > 1`` is exactly
     the unidentifiable ``gamma -> 0/1`` boundary we want to forbid.
     """
-    if x <= 0.0 or x >= 1.0:
-        # Beta(1,1) is flat and finite on the closed interval; every other
-        # shape with alpha,beta >= 1 vanishes at the boundary.
-        if alpha == 1.0 and beta == 1.0:
-            return 0.0
-        return float("-inf")
-    return (
-        (alpha - 1.0) * math.log(x)
-        + (beta - 1.0) * math.log1p(-x)
-        - (math.lgamma(alpha) + math.lgamma(beta) - math.lgamma(alpha + beta))
-    )
+    return _core._seq_log_beta_pdf(x, alpha, beta)
 
 
 # Moved to GraphUtils so DIMPLE's ground-truth oracle can share it.
@@ -297,83 +288,7 @@ def log_prior_seq(
         The log prior (``-inf`` if the reticulation cap is exceeded or the
         network sits in an unidentifiable/degenerate region).
     """
-    reticulations = [v for v in species_net.V() if v.is_reticulation()]
-    n_ret = len(reticulations)
-    if n_ret > priors.max_reticulations:
-        return float("-inf")
-
-    # --- Identifiability guards: forbid degenerate reticulations ----------
-    # These are hard constraints (prior = 0) because, unlike a soft prior, they
-    # must still bite against a likelihood that is O(1e5) nats on large data.
-    if n_ret:
-        for r in reticulations:
-            if priors.min_cycle_size > 0:
-                csize = _reticulation_cycle_size(species_net, r)
-                if csize < priors.min_cycle_size:
-                    return float("-inf")
-            if priors.min_branch_length > 0.0:
-                for e in species_net.in_edges(r):
-                    if float(e.get_length()) < priors.min_branch_length:
-                        return float("-inf")
-
-    lp = _log_poisson_pmf(n_ret, priors.poisson_mean)
-
-    # Topology normaliser: E starts at 2n-2 (n leaves) and grows by 3 per
-    # reticulation; each reticulation contributes -log(E(E-1)).
-    n_leaves = len(species_net.get_leaves())
-    edges = 2 * n_leaves - 2
-    for _ in range(n_ret):
-        if edges > 1:
-            lp -= math.log(edges * (edges - 1))
-        edges += 3
-
-    lp += _log_gamma_pdf(theta, priors.theta_shape, priors.theta_prior_mean)
-
-    # Exp(delta) prior on every branch length, p(C_lambda | delta) (Wen et al.
-    # 2016).  This is the term PhyNetPy previously omitted; it makes the
-    # posterior proper over branch lengths and, crucially, supplies the density
-    # term that offsets the RJMCMC proposal-volume factor on add/delete.  A
-    # uniform proposal on a window of width w has density 1/w; a matched Exp
-    # prior contributes ~log(delta) per branch, so delta*w ~ O(1) rather than
-    # the ~e^7 substitution-scale window blowing up the trans-dimensional ratio.
-    # Lengths are derived from the ultrametric node heights (height(parent) -
-    # height(child)) so the term is consistent with the geometry the MSNC /
-    # Felsenstein factors read and avoids the stale-length-field warning.
-    if priors.use_branch_length_prior and priors.branch_length_mean > 0.0:
-        bl_rate = 1.0 / priors.branch_length_mean
-        log_bl_rate = math.log(bl_rate)
-        heights = _node_heights(species_net)
-        for e in species_net.E():
-            length = heights[e.src] - heights[e.dest]
-            if length < 0.0:
-                length = 0.0
-            lp += log_bl_rate - bl_rate * length
-
-    # Beta prior on each reticulation's inheritance probability.  Beta(2,2)
-    # (default) -> -inf at gamma = 0/1, keeping the chain off the vestigial
-    # (unidentifiable) reticulation boundary the freeze parked on.
-    if n_ret and not (priors.gamma_alpha == 1.0 and priors.gamma_beta == 1.0):
-        for r in reticulations:
-            in_e = list(species_net.in_edges(r))
-            if in_e:
-                g = in_e[0].get_gamma()
-                if g is not None:
-                    lp += _log_beta_pdf(
-                        float(g), priors.gamma_alpha, priors.gamma_beta
-                    )
-
-    if priors.use_diameter_prior and n_ret:
-        height_cache: dict[Node, float] = {}
-        rate = 1.0 / priors.diameter_mean
-        for r in reticulations:
-            parents = species_net.get_parents(r)
-            if len(parents) >= 2:
-                h0 = _node_height(species_net, parents[0], height_cache)
-                h1 = _node_height(species_net, parents[1], height_cache)
-                diam = abs(h0 - h1)
-                lp += math.log(rate) - rate * diam
-
-    return lp
+    return _core._seq_log_prior_seq(species_net, theta, priors)
 
 
 # ======================================================================
@@ -391,12 +306,7 @@ def _sync_lengths(net: Network, heights: dict[Node, float]) -> None:
         net: Network to update in place.
         heights: Node -> height map covering every node.
     """
-    for e in net.E():
-        src, dest = e.src, e.dest
-        length = heights[src] - heights[dest]
-        if length < 0.0:
-            length = 0.0
-        e.set_length(float(length))
+    _core._seq_sync_lengths(net, heights)
 
 
 def _descendant_species(
@@ -412,27 +322,7 @@ def _descendant_species(
     Returns:
         ``node -> frozenset(species labels)`` for every node.
     """
-    memo: dict[Node, frozenset] = {}
-
-    def desc(v: Node) -> frozenset:
-        """Memoized species-label set at/below ``v``."""
-        cached = memo.get(v)
-        if cached is not None:
-            return cached
-        kids = net.get_children(v)
-        if not kids:
-            r = frozenset({species_of.get(v.label, v.label)})
-        else:
-            acc: set = set()
-            for c in kids:
-                acc |= desc(c)
-            r = frozenset(acc)
-        memo[v] = r
-        return r
-
-    for v in net.V():
-        desc(v)
-    return memo
+    return _core._seq_descendant_species(net, species_of)
 
 
 def _enforce_embedding_consistency(
@@ -467,43 +357,10 @@ def _enforce_embedding_consistency(
     Returns:
         The applied scale factor (``1.0`` if the start was already valid).
     """
-    sp_desc = _descendant_species(species_net, {})
-    sp_heights = net_heights
-    # Species nodes in ascending height order, to find the lowest node whose
-    # descendant-species set covers a given coalescence (its MRCA).
-    nodes_by_h = sorted(species_net.V(), key=lambda v: sp_heights[v])
-
-    # Upper bound on each species node's height = min height of any cross-
-    # species coalescence whose species MRCA is that node.
-    bounds: dict[Node, float] = {v: math.inf for v in species_net.V()}
-    for gi, gt in enumerate(gene_trees):
-        gh = gt_heights[gi]
-        gdesc = _descendant_species(gt, species_of)
-        for u in gt.V():
-            if not gt.get_children(u):
-                continue
-            su = gdesc[u]
-            if len(su) < 2:  # within-species coalescence: unconstrained
-                continue
-            hu = gh[u]
-            for v in nodes_by_h:  # lowest node covering su == the MRCA
-                if su <= sp_desc[v]:
-                    if hu < bounds[v]:
-                        bounds[v] = hu
-                    break
-
-    scale = 1.0
-    for v, upper in bounds.items():
-        h = sp_heights[v]
-        if math.isfinite(upper) and h > 0.0:
-            ratio = (1.0 - eps) * upper / h
-            if ratio < scale:
-                scale = ratio
-
-    if scale < 1.0:
-        for v in net_heights:
-            net_heights[v] *= scale
-    return scale
+    return _core._seq_enforce_embedding_consistency(
+        species_net, net_heights, list(gene_trees), list(gt_heights),
+        species_of, eps,
+    )
 
 
 # ======================================================================
@@ -512,20 +369,7 @@ def _enforce_embedding_consistency(
 
 def _jc_distance(s1: str, s2: str) -> float:
     """Jukes-Cantor corrected distance between two aligned sequences."""
-    n = 0
-    diff = 0
-    for a, b in zip(s1, s2):
-        a, b = a.upper(), b.upper()
-        if a in "ACGT" and b in "ACGT":
-            n += 1
-            if a != b:
-                diff += 1
-    if n == 0:
-        return 1.0
-    p = diff / n
-    if p >= 0.75:
-        return 3.0  # saturated; cap the correction
-    return -0.75 * math.log(1.0 - (4.0 / 3.0) * p)
+    return _core._seq_jc_distance(s1, s2)
 
 
 def build_upgma_gene_tree(alignment: dict[str, str]) -> Network:
@@ -542,67 +386,7 @@ def build_upgma_gene_tree(alignment: dict[str, str]) -> Network:
     Returns:
         A rooted, ultrametric :class:`Network` (a tree).
     """
-    labels = list(alignment.keys())
-    if len(labels) == 1:
-        net = Network(
-            branch_length_unit=BranchLengthUnit.SUBSTITUTIONS_PER_SITE
-        )
-        only = Node(name=labels[0])
-        net.add_nodes(only)
-        return net
-
-    # Pairwise JC distance matrix.
-    clusters: list[dict[str, Any]] = []
-    for lab in labels:
-        clusters.append({"newick": lab, "height": 0.0, "size": 1, "members": [lab]})
-    dist: dict[tuple[int, int], float] = {}
-    for i in range(len(labels)):
-        for j in range(i + 1, len(labels)):
-            dist[(i, j)] = _jc_distance(alignment[labels[i]], alignment[labels[j]])
-
-    active = list(range(len(labels)))
-    next_id = len(labels)
-    while len(active) > 1:
-        # Find closest pair.
-        best = None
-        best_d = float("inf")
-        for a in range(len(active)):
-            for b in range(a + 1, len(active)):
-                ia, ib = active[a], active[b]
-                key = (min(ia, ib), max(ia, ib))
-                d = dist[key]
-                if d < best_d:
-                    best_d = d
-                    best = (a, b)
-        a, b = best
-        ia, ib = active[a], active[b]
-        ca, cb = clusters[ia], clusters[ib]
-        new_height = best_d / 2.0
-        la = max(new_height - ca["height"], 1e-9)
-        lb = max(new_height - cb["height"], 1e-9)
-        new_newick = f"({ca['newick']}:{la:.10f},{cb['newick']}:{lb:.10f})I{next_id}"
-        new_cluster = {
-            "newick": new_newick,
-            "height": new_height,
-            "size": ca["size"] + cb["size"],
-            "members": ca["members"] + cb["members"],
-        }
-        clusters.append(new_cluster)
-        new_idx = len(clusters) - 1
-        # Update distances (UPGMA average linkage).
-        remaining = [x for k, x in enumerate(active) if k not in (a, b)]
-        for ic in remaining:
-            d_ac = dist[(min(ia, ic), max(ia, ic))]
-            d_bc = dist[(min(ib, ic), max(ib, ic))]
-            avg = (ca["size"] * d_ac + cb["size"] * d_bc) / (ca["size"] + cb["size"])
-            dist[(min(new_idx, ic), max(new_idx, ic))] = avg
-        active = remaining + [new_idx]
-        next_id += 1
-
-    return Network.from_newick(
-        clusters[active[0]]["newick"] + ";",
-        branch_length_unit=BranchLengthUnit.SUBSTITUTIONS_PER_SITE,
-    )
+    return _core._seq_build_upgma_gene_tree(alignment)
 
 
 # ======================================================================
@@ -844,10 +628,7 @@ class SeqState:
 
 def _internal_nodes(net: Network) -> list[Node]:
     """Non-root internal nodes (in-degree >= 1 and out-degree >= 1)."""
-    return [
-        v for v in net.V()
-        if net.out_degree(v) > 0 and net.in_degree(v) > 0
-    ]
+    return _core._seq_internal_nodes(net)
 
 
 def op_change_theta(
@@ -858,18 +639,7 @@ def op_change_theta(
     A multiplicative random walk ``theta' = theta * exp(window*(u-0.5))``; the
     Hastings ratio of a scale move on one positive parameter is ``log(f)``.
     """
-    old = state.theta
-    snap = state._engine.clone_caches()
-    f = math.exp(window * (rng.random() - 0.5))
-    state.theta = old * f
-    state._engine.invalidate_network()
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.theta = old
-        state._engine.restore_caches(snap)
-
-    return math.log(f), undo
+    return _core._seq_op_change_theta(state, rng, window)
 
 
 def op_change_gamma(
@@ -879,43 +649,7 @@ def op_change_gamma(
 
     Symmetric proposal -> Hastings ratio 0.
     """
-    reticulations = [v for v in state.species_net.V() if v.is_reticulation()]
-    if not reticulations:
-        return None
-    old_net = state.species_net
-    old_heights = state.net_heights
-    snap = state._engine.clone_caches()
-
-    new_net = _clone_net(old_net)
-    new_heights = _node_heights(new_net)
-    rets = [v for v in new_net.V() if v.is_reticulation()]
-    r = rets[int(rng.integers(len(rets)))]
-    in_edges = list(new_net.in_edges(r))
-    if len(in_edges) < 2:
-        return None
-    e0, e1 = in_edges[0], in_edges[1]
-    g = e0.get_gamma()
-    g_new = g + window * (rng.random() - 0.5)
-    # Reflect into (0, 1).
-    while g_new <= 0.0 or g_new >= 1.0:
-        if g_new <= 0.0:
-            g_new = -g_new
-        if g_new >= 1.0:
-            g_new = 2.0 - g_new
-    e0.set_gamma(float(g_new))
-    e1.set_gamma(float(1.0 - g_new))
-    _sync_lengths(new_net, new_heights)
-    state.species_net = new_net
-    state.net_heights = new_heights
-    state._engine.invalidate_network()
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state._engine.restore_caches(snap)
-
-    return 0.0, undo
+    return _core._seq_op_change_gamma(state, rng, window)
 
 
 def _slide_height_move(
@@ -930,86 +664,21 @@ def _slide_height_move(
     min parent height)`` (symmetric, HR 0); the root is scaled up/down
     (HR ``log(f)``).  Returns ``None`` if no valid move exists.
     """
-    internal = _internal_nodes(net)
-    root = net.root()
-    candidates = internal + [root]
-    if not candidates:
-        return None
-    node = candidates[int(rng.integers(len(candidates)))]
-    children = net.get_children(node)
-    lower = max((heights[c] for c in children), default=0.0)
-
-    if node is root or net.in_degree(node) == 0:
-        f = math.exp(root_scale_window * (rng.random() - 0.5))
-        new_h = heights[node] * f
-        if new_h <= lower:
-            return None
-        heights[node] = new_h
-        return math.log(f)
-
-    parents = net.get_parents(node)
-    upper = min(heights[p] for p in parents)
-    if upper <= lower:
-        return None
-    heights[node] = lower + (upper - lower) * rng.random()
-    return 0.0
+    return _core._seq_slide_height_move(net, heights, rng, root_scale_window)
 
 
 def op_net_node_height(
     state: SeqState, rng: np.random.Generator, *, root_scale_window: float = 0.3
 ) -> Optional[tuple[float, Callable]]:
     """Slide / scale a species-network node height."""
-    old_net = state.species_net
-    old_heights = state.net_heights
-    snap = state._engine.clone_caches()
-
-    new_net = _clone_net(old_net)
-    new_heights = _node_heights(new_net)
-    loghr = _slide_height_move(new_net, new_heights, rng, root_scale_window)
-    if loghr is None:
-        return None
-    _sync_lengths(new_net, new_heights)
-    state.species_net = new_net
-    state.net_heights = new_heights
-    state._engine.invalidate_network()
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_net_node_height(state, rng, root_scale_window)
 
 
 def op_gene_node_height(
     state: SeqState, rng: np.random.Generator, *, root_scale_window: float = 0.3
 ) -> Optional[tuple[float, Callable]]:
     """Slide / scale a gene-tree node height (random locus)."""
-    if state._engine.n_loci == 0:
-        return None
-    i = int(rng.integers(state._engine.n_loci))
-    old_gt = state.gene_trees[i]
-    old_h = state.gt_heights[i]
-    snap = state._engine.clone_caches()
-
-    new_gt = _clone_net(old_gt)
-    new_h = _node_heights(new_gt)
-    loghr = _slide_height_move(new_gt, new_h, rng, root_scale_window)
-    if loghr is None:
-        return None
-    _sync_lengths(new_gt, new_h)
-    state.gene_trees[i] = new_gt
-    state.gt_heights[i] = new_h
-    state._engine.invalidate_locus(i)
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.gene_trees[i] = old_gt
-        state.gt_heights[i] = old_h
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_gene_node_height(state, rng, root_scale_window)
 
 
 def op_gene_tree_nni(
@@ -1022,60 +691,7 @@ def op_gene_tree_nni(
     the proposal is symmetric (Hastings ratio 0); the move is rejected when the
     swap would violate the ultrametric ordering.
     """
-    if state._engine.n_loci == 0:
-        return None
-    i = int(rng.integers(state._engine.n_loci))
-    old_gt = state.gene_trees[i]
-    old_h = state.gt_heights[i]
-    snap = state._engine.clone_caches()
-
-    new_gt = _clone_net(old_gt)
-    new_h = _node_heights(new_gt)
-
-    # Eligible internal edges: (p, v) where v is internal and p has a sibling.
-    internal = [v for v in new_gt.V() if new_gt.out_degree(v) >= 2]
-    eligible: list[tuple[Node, Node, Node, Node]] = []
-    for v in internal:
-        parents = new_gt.get_parents(v)
-        if not parents:
-            continue
-        p = parents[0]
-        sibs = [c for c in new_gt.get_children(p) if c is not v]
-        if not sibs:
-            continue
-        s = sibs[0]
-        v_children = new_gt.get_children(v)
-        if len(v_children) < 2:
-            continue
-        c = v_children[int(rng.integers(len(v_children)))]
-        eligible.append((p, v, s, c))
-    if not eligible:
-        return None
-    p, v, s, c = eligible[int(rng.integers(len(eligible)))]
-
-    # Validity: after swapping s under v and c under p, need h[v] > h[s].
-    if new_h[v] <= new_h[s]:
-        return None
-
-    e_ps = _edge_between(new_gt, p, s)
-    e_vc = _edge_between(new_gt, v, c)
-    new_gt.remove_edge(e_ps)
-    new_gt.remove_edge(e_vc)
-    new_gt.add_edges(Edge(p, c))
-    new_gt.add_edges(Edge(v, s))
-    _sync_lengths(new_gt, new_h)
-
-    state.gene_trees[i] = new_gt
-    state.gt_heights[i] = new_h
-    state._engine.invalidate_locus(i)
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.gene_trees[i] = old_gt
-        state.gt_heights[i] = old_h
-        state._engine.restore_caches(snap)
-
-    return 0.0, undo
+    return _core._seq_op_gene_tree_nni(state, rng)
 
 
 def _split_edge(
@@ -1085,13 +701,7 @@ def _split_edge(
 
     Returns the new node (added to ``net`` and ``heights``).
     """
-    e = _edge_between(net, parent, child)
-    net.remove_edge(e)
-    mid = net.add_uid_node()
-    heights[mid] = t
-    net.add_edges(Edge(parent, mid))
-    net.add_edges(Edge(mid, child))
-    return mid
+    return _core._seq_split_edge(net, heights, parent, child, t)
 
 
 def _has_parallel_edges(net: Network) -> bool:
@@ -1104,25 +714,12 @@ def _has_parallel_edges(net: Network) -> bool:
     (unbounded log posterior, ``theta`` collapse).  PhyloNet's moves forbid
     these configurations; so do we.
     """
-    for v in net.V():
-        srcs = [e.src for e in net.in_edges(v)]
-        if len(srcs) != len({id(s) for s in srcs}):
-            return True
-    return False
+    return _core._seq_has_parallel_edges(net)
 
 
 def _logsumexp(values: Sequence[float]) -> float:
     """Numerically stable ``log(sum(exp(v)))`` (``-inf`` for an empty list)."""
-    m = float("-inf")
-    for v in values:
-        if v > m:
-            m = v
-    if m == float("-inf"):
-        return float("-inf")
-    acc = 0.0
-    for v in values:
-        acc += math.exp(v - m)
-    return m + math.log(acc)
+    return _core._seq_logsumexp([float(v) for v in values])
 
 
 def _network_only_log_score(state: "SeqState", net: Network) -> float:
@@ -1155,35 +752,7 @@ def _network_only_log_score(state: "SeqState", net: Network) -> float:
     Returns ``-inf`` only if some locus cannot embed at *any* scale (a genuinely
     zero-probability network).
     """
-    eng = state._engine
-    net_idx, sp_heights = build_network_msnc_index(net)
-    if sp_heights is None:
-        return float("-inf")
-    total = 0.0
-    for i in range(eng.n_loci):
-        gti, events = eng._gene_index(i, state.gene_trees[i])
-        terms: list[float] = []
-        for s in _HEIGHT_SCALE_GRID:
-            sev = events if s == 1.0 else [
-                (t * s, a, b, c) for (t, a, b, c) in events
-            ]
-            d = msnc_log_density_prebuilt(
-                net_idx,
-                sp_heights,
-                gti,
-                sev,
-                state.theta,
-                state.branch_thetas,
-            )
-            if math.isfinite(d):
-                terms.append(d)
-        if not terms:
-            return float("-inf")
-        total += _logsumexp(terms)
-    total += log_prior_seq(net, state.theta, state.priors)
-    if not math.isfinite(total):
-        return float("-inf")
-    return total
+    return _core._seq_network_only_log_score(state, net)
 
 
 def _find_edge_by_labels(
@@ -1195,10 +764,7 @@ def _find_edge_by_labels(
     preserved across :func:`copy.deepcopy`, but node *labels* are, and in a
     bubble-free network an ordered label pair identifies a unique edge.
     """
-    for e in net.E():
-        if e.src.label == src_label and e.dest.label == dest_label:
-            return e
-    return None
+    return _core._seq_find_edge_by_labels(net, src_label, dest_label)
 
 
 def _add_reticulation_placements(
@@ -1225,61 +791,7 @@ def _add_reticulation_placements(
         ``retic_labels`` (ordered ``(src_label, dest_label)`` tuples), ``l2``
         (reticulation-edge length), and ``s_rep`` (representative log score).
     """
-    edges = list(net.E())
-    placements: list[dict] = []
-    for d in edges:
-        v3, v4 = d.src, d.dest
-        l1 = heights[v3] - heights[v4]
-        if l1 <= 0.0:
-            continue
-        for r in edges:
-            if r is d:
-                continue
-            v5, v6 = r.src, r.dest
-            l2 = heights[v5] - heights[v6]
-            if l2 <= 0.0:
-                continue
-            t2 = heights[v6] + 0.5 * l2
-            lo = max(heights[v4], t2)
-            hi = heights[v3]
-            if hi <= lo:
-                continue
-            t1 = 0.5 * (lo + hi)
-            cand = _clone_net(net)
-            ch = _node_heights(cand)
-            cd = _find_edge_by_labels(cand, v3.label, v4.label)
-            cr = _find_edge_by_labels(cand, v5.label, v6.label)
-            if cd is None or cr is None:
-                continue
-            try:
-                cv1 = _split_edge(cand, ch, cd.src, cd.dest, t1)
-                cv2 = _split_edge(cand, ch, cr.src, cr.dest, t2)
-                in_e = list(cand.in_edges(cv2))
-                if len(in_e) != 1:
-                    continue
-                in_e[0].set_gamma(0.5)
-                cv2.set_is_reticulation(True)
-                cand.add_edges(Edge(cv1, cv2, gamma=0.5))
-            except Exception:
-                continue
-            if _has_parallel_edges(cand):
-                continue
-            try:
-                if not cand.is_acyclic():
-                    continue
-            except Exception:
-                continue
-            _sync_lengths(cand, ch)
-            s_rep = _network_only_log_score(state, cand)
-            if not math.isfinite(s_rep):
-                continue
-            placements.append({
-                "donor_labels": (v3.label, v4.label),
-                "retic_labels": (v5.label, v6.label),
-                "l2": l2,
-                "s_rep": s_rep,
-            })
-    return placements
+    return _core._seq_add_reticulation_placements(state, net, heights)
 
 
 def _geometric_placements(
@@ -1306,25 +818,7 @@ def _geometric_placements(
 
     Returns dicts with ``donor_labels`` and ``retic_labels`` only.
     """
-    edges = list(net.E())
-    out: list[dict] = []
-    for d in edges:
-        v3, v4 = d.src, d.dest
-        if heights[v3] - heights[v4] <= 0.0:
-            continue
-        for r in edges:
-            if r is d:
-                continue
-            v5, v6 = r.src, r.dest
-            if heights[v5] - heights[v6] <= 0.0:
-                continue
-            if heights[v3] <= max(heights[v4], heights[v6]):
-                continue
-            out.append({
-                "donor_labels": (v3.label, v4.label),
-                "retic_labels": (v5.label, v6.label),
-            })
-    return out
+    return _core._seq_geometric_placements(net, heights)
 
 
 def op_add_reticulation(
@@ -1360,83 +854,7 @@ def op_add_reticulation(
     accepted with high probability whenever *any* placement improves the
     posterior -- the property blind proposals lack.
     """
-    R = state.num_reticulations()
-    if R >= state.priors.max_reticulations:
-        return None
-    old_net = state.species_net
-    old_heights = state.net_heights
-
-    placements = _add_reticulation_placements(state, old_net, old_heights)
-    if not placements:
-        return None
-
-    s_reps = [p["s_rep"] for p in placements]
-    lse = _logsumexp(s_reps)
-    probs = np.asarray([math.exp(s - lse) for s in s_reps], dtype=np.float64)
-    probs /= probs.sum()
-    k = int(rng.choice(len(placements), p=probs))
-    chosen = placements[k]
-    s_star = chosen["s_rep"]
-
-    snap = state._engine.clone_caches()
-    new_net = _clone_net(old_net)
-    new_heights = _node_heights(new_net)
-    d = _find_edge_by_labels(new_net, *chosen["donor_labels"])
-    r = _find_edge_by_labels(new_net, *chosen["retic_labels"])
-    if d is None or r is None:
-        return None
-    v3, v4 = d.src, d.dest
-    v5, v6 = r.src, r.dest
-    l2 = new_heights[v5] - new_heights[v6]
-    if l2 <= 0.0:
-        return None
-    t2 = new_heights[v6] + l2 * rng.random()
-    lo = max(new_heights[v4], t2)
-    hi = new_heights[v3]
-    win = hi - lo
-    if win <= 0.0:
-        return None
-    t1 = lo + win * rng.random()
-    g = float(rng.random())
-    try:
-        v1 = _split_edge(new_net, new_heights, v3, v4, t1)
-        v2 = _split_edge(new_net, new_heights, v5, v6, t2)
-        in_e = list(new_net.in_edges(v2))
-        if len(in_e) != 1:
-            return None
-        in_e[0].set_gamma(1.0 - g)
-        v2.set_is_reticulation(True)
-        new_net.add_edges(Edge(v1, v2, gamma=g))
-    except Exception:
-        return None
-    if _has_parallel_edges(new_net):
-        return None
-    try:
-        if not new_net.is_acyclic():
-            return None
-    except Exception:
-        return None
-
-    loghr = (
-        lse
-        - s_star
-        - math.log(2.0 * (R + 1))
-        + math.log(l2)
-        + math.log(win)
-    )
-
-    _sync_lengths(new_net, new_heights)
-    state.species_net = new_net
-    state.net_heights = new_heights
-    state._engine.invalidate_network()
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_add_reticulation(state, rng)
 
 
 def op_delete_reticulation(
@@ -1471,124 +889,7 @@ def op_delete_reticulation(
     and ``s_rep_rev`` cancel exactly against the matching add, guaranteeing
     reversibility.
     """
-    R = state.num_reticulations()
-    if R == 0:
-        return None
-    old_net = state.species_net
-    old_heights = state.net_heights
-
-    rets = [v for v in old_net.V() if v.is_reticulation()]
-    v2 = rets[int(rng.integers(len(rets)))]
-    parents = old_net.get_parents(v2)
-    if len(parents) != 2:
-        return None
-    v1 = parents[int(rng.integers(2))]
-    v5 = parents[1] if parents[0] is v1 else parents[0]
-
-    if v1.is_reticulation() or old_net.in_degree(v1) == 0:
-        return None
-    v3s = old_net.get_parents(v1)
-    if len(v3s) != 1:
-        return None
-    v3 = v3s[0]
-    other_children = [c for c in old_net.get_children(v1) if c is not v2]
-    if len(other_children) != 1:
-        return None
-    v4 = other_children[0]
-    v6s = old_net.get_children(v2)
-    if len(v6s) != 1:
-        return None
-    v6 = v6s[0]
-
-    if v3 in old_net.get_parents(v4):
-        return None
-    if v5 in old_net.get_parents(v6):
-        return None
-    if v3 is v5 and v4 is v6:
-        return None
-
-    # Reverse-add quantities, recovered from the pre-delete network: the merged
-    # reticulation edge is v5 -> v6 (length l2), and the donor window is the
-    # portion of the merged donor edge v3 -> v4 above the reticulation height.
-    l2 = old_heights[v5] - old_heights[v6]
-    if l2 <= 0.0:
-        return None
-    t2 = old_heights[v2]
-    lo = max(old_heights[v4], t2)
-    hi = old_heights[v3]
-    win = hi - lo
-    if win <= 0.0:
-        return None
-    rev_donor = (v3.label, v4.label)
-    rev_retic = (v5.label, v6.label)
-
-    snap = state._engine.clone_caches()
-    new_net = _clone_net(old_net)
-    new_heights = _node_heights(new_net)
-    cv2 = None
-    for v in new_net.V():
-        if v.is_reticulation() and v.label == v2.label:
-            cv2 = v
-            break
-    if cv2 is None:
-        return None
-    cparents = new_net.get_parents(cv2)
-    cv1 = next((p for p in cparents if p.label == v1.label), None)
-    if cv1 is None:
-        return None
-
-    try:
-        del_edge = _edge_between(new_net, cv1, cv2)
-        new_net.remove_edge(del_edge)
-        cv2.set_is_reticulation(False)
-        _suppress_degree2(new_net, new_heights, cv1)
-        _suppress_degree2(new_net, new_heights, cv2)
-    except Exception:
-        return None
-
-    E_after = len([e for e in new_net.E()])
-    if E_after < 2:
-        return None
-    _sync_lengths(new_net, new_heights)
-
-    # Reverse-add normaliser: enumerate placements on the post-delete network
-    # (the exact network the reverse add would start from) with the identical
-    # rule the add uses, and find the placement that recreates this reticulation.
-    placements = _add_reticulation_placements(state, new_net, new_heights)
-    if not placements:
-        return None
-    s_reps = [p["s_rep"] for p in placements]
-    lse = _logsumexp(s_reps)
-    s_rev = None
-    for p in placements:
-        if p["donor_labels"] == rev_donor and p["retic_labels"] == rev_retic:
-            s_rev = p["s_rep"]
-            break
-    if s_rev is None:
-        # The reverse add cannot regenerate this exact placement (e.g. the
-        # merged donor edge dropped out of the feasible set); the move is not
-        # reversible from here, so decline it.
-        return None
-
-    loghr = (
-        s_rev
-        - lse
-        + math.log(2.0 * R)
-        - math.log(l2)
-        - math.log(win)
-    )
-
-    state.species_net = new_net
-    state.net_heights = new_heights
-    state._engine.invalidate_network()
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_delete_reticulation(state, rng)
 
 
 def _suppress_degree2(
@@ -1599,25 +900,7 @@ def _suppress_degree2(
     Has no effect if ``node`` is not degree-2.  Returns the resulting edge
     count.
     """
-    if net.in_degree(node) != 1 or net.out_degree(node) != 1:
-        return len([e for e in net.E()])
-    in_e = list(net.in_edges(node))[0]
-    out_e = list(net.out_edges(node))[0]
-    parent = in_e.src
-    child = out_e.dest
-    # The inheritance probability belongs to the edge entering ``child``; if
-    # ``child`` is a reticulation that gamma must survive the merge (using the
-    # *outgoing* edge's gamma, not the incoming tree edge's).
-    gamma = out_e.get_gamma()
-    net.remove_edge(in_e)
-    net.remove_edge(out_e)
-    net.remove_nodes(node)
-    heights.pop(node, None)
-    merged = Edge(parent, child)
-    if child.is_reticulation():
-        merged.set_gamma(gamma)
-    net.add_edges(merged)
-    return len([e for e in net.E()])
+    return _core._seq_suppress_degree2(net, heights, node)
 
 
 # ======================================================================
@@ -1658,7 +941,7 @@ def _suppress_degree2(
 
 def _leaf_descendants(net: Network, node: Node) -> frozenset:
     """Frozenset of leaf *labels* reachable below ``node``."""
-    return frozenset(leaf.label for leaf in net.leaf_descendants(node))
+    return _core._seq_leaf_descendants(net, node)
 
 
 def _gt_signature(gt: Network, heights: dict[Node, float]) -> frozenset:
@@ -1671,19 +954,12 @@ def _gt_signature(gt: Network, heights: dict[Node, float]) -> frozenset:
     boundary (object identity is not preserved by copying, but the signature
     is).
     """
-    return frozenset(
-        (labels, round(float(heights.get(v, 0.0)), 12))
-        for v, labels in _leaf_labels_below(gt).items()
-        if gt.get_children(v)
-    )
+    return _core._seq_gt_signature(gt, heights)
 
 
 def _node_by_leafset(net: Network, target: frozenset) -> Optional[Node]:
     """The unique node whose descendant-leaf-set equals ``target`` (or None)."""
-    for v in net.V():
-        if _leaf_descendants(net, v) == target:
-            return v
-    return None
+    return _core._seq_node_by_leafset(net, target)
 
 
 def _gene_tree_nni_neighbors(
@@ -1701,56 +977,7 @@ def _gene_tree_nni_neighbors(
     Returns ``(neighbour_gt, neighbour_heights)`` deep copies with edge lengths
     already synced; duplicates (by :func:`_gt_signature`) are dropped.
     """
-    quads: list[tuple[frozenset, frozenset]] = []
-    for v in gt.V():
-        kids = gt.get_children(v)
-        if len(kids) < 2:
-            continue
-        parents = gt.get_parents(v)
-        if not parents:
-            continue
-        p = parents[0]
-        sibs = [c for c in gt.get_children(p) if c is not v]
-        if len(sibs) != 1:
-            continue
-        s = sibs[0]
-        if heights[v] <= heights[s]:
-            continue
-        v_ls = _leaf_descendants(gt, v)
-        s_ls = _leaf_descendants(gt, s)
-        for c in kids:
-            quads.append((s_ls, _leaf_descendants(gt, c), v_ls))
-
-    neighbors: list[tuple[Network, dict]] = []
-    seen: set = set()
-    for s_ls, c_ls, _v_ls in quads:
-        cand = _clone_net(gt)
-        ch = _node_heights(cand)
-        cs = _node_by_leafset(cand, s_ls)
-        cc = _node_by_leafset(cand, c_ls)
-        if cs is None or cc is None:
-            continue
-        cp_list = cand.get_parents(cs)
-        cv_list = cand.get_parents(cc)
-        if not cp_list or not cv_list:
-            continue
-        cp, cv = cp_list[0], cv_list[0]
-        if cp is cv:
-            continue
-        try:
-            cand.remove_edge(_edge_between(cand, cp, cs))
-            cand.remove_edge(_edge_between(cand, cv, cc))
-            cand.add_edges(Edge(cp, cc))
-            cand.add_edges(Edge(cv, cs))
-        except Exception:
-            continue
-        _sync_lengths(cand, ch)
-        sig = _gt_signature(cand, ch)
-        if sig in seen:
-            continue
-        seen.add(sig)
-        neighbors.append((cand, ch))
-    return neighbors
+    return _core._seq_gene_tree_nni_neighbors(gt, heights)
 
 
 # Symmetric-under-reciprocal grid of gene-tree height-scale factors.  Because
@@ -1790,12 +1017,7 @@ def _scaled_gene_tree(
     same topology and rescaled coalescent times.  ``s == 1.0`` is an identity
     (still a fresh copy so the caller owns an independent object).
     """
-    cand = _clone_net(gt)
-    ch = _node_heights(cand)
-    if s != 1.0:
-        ch = {v: h * s for v, h in ch.items()}
-        _sync_lengths(cand, ch)
-    return cand, ch
+    return _core._seq_scaled_gene_tree(gt, s)
 
 
 def _candidate_set(
@@ -1811,19 +1033,7 @@ def _candidate_set(
     (NNI symmetry + reciprocal scale grid), the guided selection stays exactly
     reversible.
     """
-    bases: list[tuple[Network, dict]] = [(gt, heights)]
-    bases.extend(_gene_tree_nni_neighbors(gt, heights))
-    out: list[tuple[Network, dict]] = []
-    seen: set = set()
-    for b_gt, _b_h in bases:
-        for s in _HEIGHT_SCALE_GRID:
-            cg, ch = _scaled_gene_tree(b_gt, s)
-            sig = _gt_signature(cg, ch)
-            if sig in seen:
-                continue
-            seen.add(sig)
-            out.append((cg, ch))
-    return out
+    return _core._seq_candidate_set(gt, heights)
 
 
 def _candidate_logweights(
@@ -1841,25 +1051,9 @@ def _candidate_logweights(
     embed (``-inf`` MSNC) or have non-finite Felsenstein get ``-inf`` weight,
     so they are never proposed and contribute zero reverse density.
     """
-    eng = state._engine
-    logw = np.full(len(candidates), -np.inf, dtype=np.float64)
-    for j, (gt, _h) in enumerate(candidates):
-        fels = eng._calcs[i].log_likelihood(gt, state.model)
-        if not math.isfinite(fels):
-            continue
-        gti, events = build_gene_tree_msnc_index(gt, eng._species_of)
-        msnc = msnc_log_density_prebuilt(
-            net_idx,
-            sp_heights,
-            gti,
-            events,
-            theta,
-            state.branch_thetas,
-        )
-        if not math.isfinite(msnc):
-            continue
-        logw[j] = fels + msnc
-    return logw
+    return _core._seq_candidate_logweights(
+        state, i, net_idx, sp_heights, theta, list(candidates)
+    )
 
 
 def _enumerate_scored_candidates(
@@ -1887,74 +1081,9 @@ def _enumerate_scored_candidates(
     independent ``(network, heights)`` for candidate ``k`` -- used to materialise
     the chosen candidate.
     """
-    eng = state._engine
-    # Identity base uses ``gt`` directly (transiently mutated + restored);
-    # NNI neighbours are already independent clones.
-    bases: list[tuple[Network, dict]] = [(gt, heights)]
-    bases.extend(_gene_tree_nni_neighbors(gt, heights))
-
-    sigs: list[frozenset] = []
-    logw: list[float] = []
-    descriptors: list[tuple[int, float]] = []
-    seen: set = set()
-    for bi, (b_gt, b_h) in enumerate(bases):
-        # Snapshot base edge lengths so every scale restores exactly.
-        base_lengths = [(e, e.get_length()) for e in b_gt.E()]
-        # The gene-tree topology index (bit map, parent/children, and the
-        # expensive coarsening cache) is scale-invariant -- rescaling all
-        # heights preserves coalescence order -- so build it once per base
-        # topology and reuse across every height scale, recomputing only the
-        # timed events. This lets the coarsening cache carry over the scales
-        # instead of being thrown away and rebuilt for each one.
-        gti = None
-        for s in _HEIGHT_SCALE_GRID:
-            if s != 1.0:
-                scaled_h = {v: h * s for v, h in b_h.items()}
-                _sync_lengths(b_gt, scaled_h)
-            else:
-                scaled_h = b_h
-            sig = _gt_signature(b_gt, scaled_h)
-            if sig in seen:
-                if s != 1.0:
-                    for e, L in base_lengths:
-                        e.set_length(float(L) if L is not None else 0.0)
-                continue
-            fels = eng._calcs[i].log_likelihood(b_gt, state.model)
-            w = -np.inf
-            if math.isfinite(fels):
-                if gti is None:
-                    gti = build_gene_tree_topology_index(b_gt, eng._species_of)
-                events = gene_tree_events(b_gt, gti, scaled_h)
-                msnc = msnc_log_density_prebuilt(
-                    net_idx,
-                    sp_heights,
-                    gti,
-                    events,
-                    theta,
-                    state.branch_thetas,
-                )
-                if math.isfinite(msnc):
-                    w = fels + msnc
-            if s != 1.0:
-                for e, L in base_lengths:
-                    e.set_length(float(L) if L is not None else 0.0)
-            seen.add(sig)
-            sigs.append(sig)
-            logw.append(w)
-            descriptors.append((bi, s))
-
-    def rebuild(k: int) -> tuple[Network, dict]:
-        """Reconstruct the ``k``-th sampled tree/heights from its descriptor."""
-        bi, s = descriptors[k]
-        b_gt, _b_h = bases[bi]
-        cg = _clone_net(b_gt)
-        ch = _node_heights(cg)
-        if s != 1.0:
-            ch = {v: h * s for v, h in ch.items()}
-        _sync_lengths(cg, ch)
-        return cg, ch
-
-    return sigs, np.asarray(logw, dtype=np.float64), rebuild
+    return _core._seq_enumerate_scored_candidates(
+        state, i, net_idx, sp_heights, theta, gt, heights
+    )
 
 
 def _coupled_gene_tree_reproposal(
@@ -1980,59 +1109,9 @@ def _coupled_gene_tree_reproposal(
     (a non-reversible corner -- decline the move) or when a candidate set has no
     finite-weight member.
     """
-    eng = state._engine
-    tgt_idx, tgt_h = build_network_msnc_index(target_net)
-    rev_idx, rev_h = build_network_msnc_index(reverse_net)
-    if tgt_h is None or rev_h is None:
-        return None
-
-    new_gts: list[Network] = []
-    new_hs: list[dict] = []
-    log_qf = 0.0
-    log_qr = 0.0
-    for i in range(eng.n_loci):
-        g_i = state.gene_trees[i]
-        h_i = state.gt_heights[i]
-        target_sig = _gt_signature(g_i, h_i)
-
-        fwd_sigs, fwd_lw, fwd_rebuild = _enumerate_scored_candidates(
-            state, i, tgt_idx, tgt_h, state.theta, g_i, h_i
-        )
-        fwd_lse = _logsumexp([float(x) for x in fwd_lw])
-        if not math.isfinite(fwd_lse):
-            return None
-        probs = np.exp(fwd_lw - fwd_lse)
-        total = float(probs.sum())
-        if not math.isfinite(total) or total <= 0.0:
-            return None
-        probs = probs / total
-        j = int(rng.choice(len(fwd_sigs), p=probs))
-        log_qf += float(fwd_lw[j]) - fwd_lse
-
-        # Materialise an independent copy of the chosen candidate.
-        chosen_gt, chosen_h = fwd_rebuild(j)
-
-        # Reverse density: candidate set around the chosen tree, scored under
-        # the reverse network; probability of re-selecting the original.
-        rev_sigs, rev_lw, _rev_rebuild = _enumerate_scored_candidates(
-            state, i, rev_idx, rev_h, state.theta, chosen_gt, chosen_h
-        )
-        rev_lse = _logsumexp([float(x) for x in rev_lw])
-        if not math.isfinite(rev_lse):
-            return None
-        match = -1
-        for jj, sig in enumerate(rev_sigs):
-            if sig == target_sig:
-                match = jj
-                break
-        if match < 0 or not math.isfinite(float(rev_lw[match])):
-            return None
-        log_qr += float(rev_lw[match]) - rev_lse
-
-        new_gts.append(chosen_gt)
-        new_hs.append(chosen_h)
-
-    return new_gts, new_hs, log_qf, log_qr
+    return _core._seq_coupled_gene_tree_reproposal(
+        state, target_net, reverse_net, rng
+    )
 
 
 def op_add_reticulation_coupled(
@@ -2054,108 +1133,7 @@ def op_add_reticulation_coupled(
     which is the exact negative of :func:`op_delete_reticulation_coupled`'s
     ratio on the matching transition.
     """
-    R = state.num_reticulations()
-    if R >= state.priors.max_reticulations:
-        return None
-    old_net = state.species_net
-    old_heights = state.net_heights
-    old_gts = state.gene_trees
-    old_gt_h = state.gt_heights
-
-    placements = _add_reticulation_placements(state, old_net, old_heights)
-    if not placements:
-        return None
-    s_reps = [p["s_rep"] for p in placements]
-    lse = _logsumexp(s_reps)
-    probs = np.asarray([math.exp(s - lse) for s in s_reps], dtype=np.float64)
-    probs /= probs.sum()
-    k = int(rng.choice(len(placements), p=probs))
-    chosen = placements[k]
-    s_star = chosen["s_rep"]
-
-    snap = state._engine.clone_caches()
-    new_net = _clone_net(old_net)
-    new_heights = _node_heights(new_net)
-    d = _find_edge_by_labels(new_net, *chosen["donor_labels"])
-    r = _find_edge_by_labels(new_net, *chosen["retic_labels"])
-    if d is None or r is None:
-        return None
-    v3, v4 = d.src, d.dest
-    v5, v6 = r.src, r.dest
-    l2 = new_heights[v5] - new_heights[v6]
-    if l2 <= 0.0:
-        return None
-    t2 = new_heights[v6] + l2 * rng.random()
-    lo = max(new_heights[v4], t2)
-    hi = new_heights[v3]
-    win = hi - lo
-    if win <= 0.0:
-        return None
-    t1 = lo + win * rng.random()
-    g = float(rng.random())
-    try:
-        v1 = _split_edge(new_net, new_heights, v3, v4, t1)
-        v2 = _split_edge(new_net, new_heights, v5, v6, t2)
-        in_e = list(new_net.in_edges(v2))
-        if len(in_e) != 1:
-            return None
-        in_e[0].set_gamma(1.0 - g)
-        v2.set_is_reticulation(True)
-        new_net.add_edges(Edge(v1, v2, gamma=g))
-    except Exception:
-        return None
-    if _has_parallel_edges(new_net):
-        return None
-    try:
-        if not new_net.is_acyclic():
-            return None
-    except Exception:
-        return None
-    # Level cap (e.g. level-1 mode): reject a proposal whose new hybrid
-    # lands in an already-occupied blob *before* paying for the coupled
-    # gene-tree re-proposal and MSNC scoring.  This is the state-space
-    # restriction that keeps the displayed-tree count (and thus the
-    # ancestral-configuration DP) from blowing up.  Consistent with the
-    # other early ``return None`` guards above (parallel edges, cycles),
-    # a pruned proposal counts as a rejection.
-    if (
-        state.priors.max_level is not None
-        and _network_level(new_net) > state.priors.max_level
-    ):
-        return None
-    _sync_lengths(new_net, new_heights)
-
-    repro = _coupled_gene_tree_reproposal(state, new_net, old_net, rng)
-    if repro is None:
-        return None
-    new_gts, new_hs, log_qf_gt, log_qr_gt = repro
-
-    loghr = (
-        lse
-        - s_star
-        - math.log(2.0 * (R + 1))
-        + math.log(l2)
-        + math.log(win)
-        + (log_qr_gt - log_qf_gt)
-    )
-
-    state.species_net = new_net
-    state.net_heights = new_heights
-    state.gene_trees = new_gts
-    state.gt_heights = new_hs
-    state._engine.invalidate_network()
-    for i in range(state._engine.n_loci):
-        state._engine.invalidate_locus(i)
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state.gene_trees = old_gts
-        state.gt_heights = old_gt_h
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_add_reticulation_coupled(state, rng)
 
 
 def op_delete_reticulation_coupled(
@@ -2175,136 +1153,7 @@ def op_delete_reticulation_coupled(
                  + \log(2 R) - \log l_2 - \log \mathrm{win}
                  + \sum_i \big(\log P^{\mathrm r}_i - \log P^{\mathrm f}_i\big).
     """
-    R = state.num_reticulations()
-    if R == 0:
-        return None
-    old_net = state.species_net
-    old_heights = state.net_heights
-    old_gts = state.gene_trees
-    old_gt_h = state.gt_heights
-
-    rets = [v for v in old_net.V() if v.is_reticulation()]
-    v2 = rets[int(rng.integers(len(rets)))]
-    parents = old_net.get_parents(v2)
-    if len(parents) != 2:
-        return None
-    v1 = parents[int(rng.integers(2))]
-    v5 = parents[1] if parents[0] is v1 else parents[0]
-
-    if v1.is_reticulation() or old_net.in_degree(v1) == 0:
-        return None
-    v3s = old_net.get_parents(v1)
-    if len(v3s) != 1:
-        return None
-    v3 = v3s[0]
-    other_children = [c for c in old_net.get_children(v1) if c is not v2]
-    if len(other_children) != 1:
-        return None
-    v4 = other_children[0]
-    v6s = old_net.get_children(v2)
-    if len(v6s) != 1:
-        return None
-    v6 = v6s[0]
-
-    if v3 in old_net.get_parents(v4):
-        return None
-    if v5 in old_net.get_parents(v6):
-        return None
-    if v3 is v5 and v4 is v6:
-        return None
-
-    l2 = old_heights[v5] - old_heights[v6]
-    if l2 <= 0.0:
-        return None
-    t2 = old_heights[v2]
-    lo = max(old_heights[v4], t2)
-    hi = old_heights[v3]
-    win = hi - lo
-    if win <= 0.0:
-        return None
-    rev_donor = (v3.label, v4.label)
-    rev_retic = (v5.label, v6.label)
-
-    snap = state._engine.clone_caches()
-    new_net = _clone_net(old_net)
-    new_heights = _node_heights(new_net)
-    cv2 = None
-    for v in new_net.V():
-        if v.is_reticulation() and v.label == v2.label:
-            cv2 = v
-            break
-    if cv2 is None:
-        return None
-    cparents = new_net.get_parents(cv2)
-    cv1 = next((p for p in cparents if p.label == v1.label), None)
-    if cv1 is None:
-        return None
-    try:
-        del_edge = _edge_between(new_net, cv1, cv2)
-        new_net.remove_edge(del_edge)
-        cv2.set_is_reticulation(False)
-        _suppress_degree2(new_net, new_heights, cv1)
-        _suppress_degree2(new_net, new_heights, cv2)
-    except Exception:
-        return None
-    if len([e for e in new_net.E()]) < 2:
-        return None
-    _sync_lengths(new_net, new_heights)
-
-    # Coupled gene-tree re-proposal, guided by the post-delete network.  Called
-    # while ``state.gene_trees`` is still the pre-delete set so the forward
-    # density samples the new trees under ``new_net`` and the reverse density
-    # rescores the old trees under ``old_net`` (the reverse add's network).
-    repro = _coupled_gene_tree_reproposal(state, new_net, old_net, rng)
-    if repro is None:
-        return None
-    new_gts, new_hs, log_qf_gt, log_qr_gt = repro
-
-    # The reverse add enumerates placements on the post-delete network using the
-    # *post-delete* gene trees, so install them before scoring.
-    state.gene_trees = new_gts
-    state.gt_heights = new_hs
-    placements = _add_reticulation_placements(state, new_net, new_heights)
-    if not placements:
-        state.gene_trees = old_gts
-        state.gt_heights = old_gt_h
-        return None
-    s_reps = [p["s_rep"] for p in placements]
-    lse = _logsumexp(s_reps)
-    s_rev = None
-    for p in placements:
-        if p["donor_labels"] == rev_donor and p["retic_labels"] == rev_retic:
-            s_rev = p["s_rep"]
-            break
-    if s_rev is None:
-        state.gene_trees = old_gts
-        state.gt_heights = old_gt_h
-        return None
-
-    loghr = (
-        s_rev
-        - lse
-        + math.log(2.0 * R)
-        - math.log(l2)
-        - math.log(win)
-        + (log_qr_gt - log_qf_gt)
-    )
-
-    state.species_net = new_net
-    state.net_heights = new_heights
-    state._engine.invalidate_network()
-    for i in range(state._engine.n_loci):
-        state._engine.invalidate_locus(i)
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state.gene_trees = old_gts
-        state.gt_heights = old_gt_h
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_delete_reticulation_coupled(state, rng)
 
 
 def op_add_reticulation_decoupled(
@@ -2333,88 +1182,7 @@ def op_add_reticulation_decoupled(
     its own and the gene trees migrate gradually via the ordinary per-locus
     NNI / height moves -- the mechanism PhyloNet's MCMC_SEQ relies on.
     """
-    R = state.num_reticulations()
-    if R >= state.priors.max_reticulations:
-        return None
-    old_net = state.species_net
-    old_heights = state.net_heights
-
-    placements = _add_reticulation_placements(state, old_net, old_heights)
-    if not placements:
-        return None
-    s_reps = [p["s_rep"] for p in placements]
-    lse = _logsumexp(s_reps)
-    probs = np.asarray([math.exp(s - lse) for s in s_reps], dtype=np.float64)
-    probs /= probs.sum()
-    k = int(rng.choice(len(placements), p=probs))
-    chosen = placements[k]
-    s_star = chosen["s_rep"]
-
-    snap = state._engine.clone_caches()
-    new_net = _clone_net(old_net)
-    new_heights = _node_heights(new_net)
-    d = _find_edge_by_labels(new_net, *chosen["donor_labels"])
-    r = _find_edge_by_labels(new_net, *chosen["retic_labels"])
-    if d is None or r is None:
-        return None
-    v3, v4 = d.src, d.dest
-    v5, v6 = r.src, r.dest
-    l2 = new_heights[v5] - new_heights[v6]
-    if l2 <= 0.0:
-        return None
-    t2 = new_heights[v6] + l2 * rng.random()
-    lo = max(new_heights[v4], t2)
-    hi = new_heights[v3]
-    win = hi - lo
-    if win <= 0.0:
-        return None
-    t1 = lo + win * rng.random()
-    g = float(rng.random())
-    try:
-        v1 = _split_edge(new_net, new_heights, v3, v4, t1)
-        v2 = _split_edge(new_net, new_heights, v5, v6, t2)
-        in_e = list(new_net.in_edges(v2))
-        if len(in_e) != 1:
-            return None
-        in_e[0].set_gamma(1.0 - g)
-        v2.set_is_reticulation(True)
-        new_net.add_edges(Edge(v1, v2, gamma=g))
-    except Exception:
-        return None
-    if _has_parallel_edges(new_net):
-        return None
-    try:
-        if not new_net.is_acyclic():
-            return None
-    except Exception:
-        return None
-    if (
-        state.priors.max_level is not None
-        and _network_level(new_net) > state.priors.max_level
-    ):
-        return None
-    _sync_lengths(new_net, new_heights)
-
-    loghr = (
-        lse
-        - s_star
-        - math.log(2.0 * (R + 1))
-        + math.log(l2)
-        + math.log(win)
-    )
-
-    state.species_net = new_net
-    state.net_heights = new_heights
-    # Gene trees unchanged: only the network-dependent MSNC factors are stale.
-    state._engine.invalidate_network()
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_add_reticulation_decoupled(state, rng)
 
 
 def op_delete_reticulation_decoupled(
@@ -2433,114 +1201,7 @@ def op_delete_reticulation_decoupled(
                  - \operatorname{logsumexp}_k s^{\mathrm{rep}}_k
                  + \log(2 R) - \log l_2 - \log \mathrm{win}.
     """
-    R = state.num_reticulations()
-    if R == 0:
-        return None
-    old_net = state.species_net
-    old_heights = state.net_heights
-
-    rets = [v for v in old_net.V() if v.is_reticulation()]
-    v2 = rets[int(rng.integers(len(rets)))]
-    parents = old_net.get_parents(v2)
-    if len(parents) != 2:
-        return None
-    v1 = parents[int(rng.integers(2))]
-    v5 = parents[1] if parents[0] is v1 else parents[0]
-
-    if v1.is_reticulation() or old_net.in_degree(v1) == 0:
-        return None
-    v3s = old_net.get_parents(v1)
-    if len(v3s) != 1:
-        return None
-    v3 = v3s[0]
-    other_children = [c for c in old_net.get_children(v1) if c is not v2]
-    if len(other_children) != 1:
-        return None
-    v4 = other_children[0]
-    v6s = old_net.get_children(v2)
-    if len(v6s) != 1:
-        return None
-    v6 = v6s[0]
-
-    if v3 in old_net.get_parents(v4):
-        return None
-    if v5 in old_net.get_parents(v6):
-        return None
-    if v3 is v5 and v4 is v6:
-        return None
-
-    l2 = old_heights[v5] - old_heights[v6]
-    if l2 <= 0.0:
-        return None
-    t2 = old_heights[v2]
-    lo = max(old_heights[v4], t2)
-    hi = old_heights[v3]
-    win = hi - lo
-    if win <= 0.0:
-        return None
-    rev_donor = (v3.label, v4.label)
-    rev_retic = (v5.label, v6.label)
-
-    snap = state._engine.clone_caches()
-    new_net = _clone_net(old_net)
-    new_heights = _node_heights(new_net)
-    cv2 = None
-    for v in new_net.V():
-        if v.is_reticulation() and v.label == v2.label:
-            cv2 = v
-            break
-    if cv2 is None:
-        return None
-    cparents = new_net.get_parents(cv2)
-    cv1 = next((p for p in cparents if p.label == v1.label), None)
-    if cv1 is None:
-        return None
-    try:
-        del_edge = _edge_between(new_net, cv1, cv2)
-        new_net.remove_edge(del_edge)
-        cv2.set_is_reticulation(False)
-        _suppress_degree2(new_net, new_heights, cv1)
-        _suppress_degree2(new_net, new_heights, cv2)
-    except Exception:
-        return None
-    if len([e for e in new_net.E()]) < 2:
-        return None
-    _sync_lengths(new_net, new_heights)
-
-    # Reverse-add placement enumeration uses the *current* (unchanged) gene
-    # trees on the post-delete network.
-    placements = _add_reticulation_placements(state, new_net, new_heights)
-    if not placements:
-        return None
-    s_reps = [p["s_rep"] for p in placements]
-    lse = _logsumexp(s_reps)
-    s_rev = None
-    for p in placements:
-        if p["donor_labels"] == rev_donor and p["retic_labels"] == rev_retic:
-            s_rev = p["s_rep"]
-            break
-    if s_rev is None:
-        return None
-
-    loghr = (
-        s_rev
-        - lse
-        + math.log(2.0 * R)
-        - math.log(l2)
-        - math.log(win)
-    )
-
-    state.species_net = new_net
-    state.net_heights = new_heights
-    state._engine.invalidate_network()
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_delete_reticulation_decoupled(state, rng)
 
 
 def _relocation_loghr(
@@ -2560,12 +1221,8 @@ def _relocation_loghr(
     -_relocation_loghr(c, d, a, b, qr, qf)`` -- which is exactly the reverse
     relocation's ratio, so the move is reversible.
     """
-    return (
-        math.log(l2_new)
-        + math.log(win_new)
-        - math.log(l2_old)
-        - math.log(win_old)
-        + (log_qr - log_qf)
+    return _core._seq_relocation_loghr(
+        l2_new, win_new, l2_old, win_old, log_qf, log_qr
     )
 
 
@@ -2608,157 +1265,7 @@ def op_relocate_reticulation_coupled(
     its own reverse, so ``logH(x->x') == -logH(x'->x)`` (checked numerically in
     ``tests/test_mcmc_seq_coupled.py``).
     """
-    R = state.num_reticulations()
-    if R == 0:
-        return None
-    old_net = state.species_net
-    old_heights = state.net_heights
-    old_gts = state.gene_trees
-    old_gt_h = state.gt_heights
-
-    # Pick reticulation A + parent to detach (defines the removed hybrid edge).
-    rets = [v for v in old_net.V() if v.is_reticulation()]
-    v2 = rets[int(rng.integers(len(rets)))]
-    parents = old_net.get_parents(v2)
-    if len(parents) != 2:
-        return None
-    v1 = parents[int(rng.integers(2))]
-    v5 = parents[1] if parents[0] is v1 else parents[0]
-    if v1.is_reticulation() or old_net.in_degree(v1) == 0:
-        return None
-    v3s = old_net.get_parents(v1)
-    if len(v3s) != 1:
-        return None
-    v3 = v3s[0]
-    other_children = [c for c in old_net.get_children(v1) if c is not v2]
-    if len(other_children) != 1:
-        return None
-    v4 = other_children[0]
-    v6s = old_net.get_children(v2)
-    if len(v6s) != 1:
-        return None
-    v6 = v6s[0]
-    if v3 in old_net.get_parents(v4):
-        return None
-    if v5 in old_net.get_parents(v6):
-        return None
-    if v3 is v5 and v4 is v6:
-        return None
-
-    # Reverse birth geometry for A, recovered from the pre-move network.
-    l2_A = old_heights[v5] - old_heights[v6]
-    if l2_A <= 0.0:
-        return None
-    t2_A = old_heights[v2]
-    lo_A = max(old_heights[v4], t2_A)
-    win_A = old_heights[v3] - lo_A
-    if win_A <= 0.0:
-        return None
-
-    # Build N0 = old_net - A (deep copy; suppress the two degree-2 nodes).
-    snap = state._engine.clone_caches()
-    n0 = _clone_net(old_net)
-    n0_h = _node_heights(n0)
-    cv2 = next(
-        (v for v in n0.V() if v.is_reticulation() and v.label == v2.label), None
-    )
-    if cv2 is None:
-        return None
-    cv1 = next(
-        (p for p in n0.get_parents(cv2) if p.label == v1.label), None
-    )
-    if cv1 is None:
-        return None
-    try:
-        n0.remove_edge(_edge_between(n0, cv1, cv2))
-        cv2.set_is_reticulation(False)
-        _suppress_degree2(n0, n0_h, cv1)
-        _suppress_degree2(n0, n0_h, cv2)
-    except Exception:
-        return None
-    if len([e for e in n0.E()]) < 2:
-        return None
-    _sync_lengths(n0, n0_h)
-
-    # Draw a new placement B uniformly from N0's geometric placements.
-    placements = _geometric_placements(n0, n0_h)
-    if not placements:
-        return None
-    b = placements[int(rng.integers(len(placements)))]
-
-    # Build N_B = N0 + B.
-    new_net = _clone_net(n0)
-    new_heights = _node_heights(new_net)
-    d = _find_edge_by_labels(new_net, *b["donor_labels"])
-    r = _find_edge_by_labels(new_net, *b["retic_labels"])
-    if d is None or r is None:
-        return None
-    b3, b4 = d.src, d.dest
-    b5, b6 = r.src, r.dest
-    l2_B = new_heights[b5] - new_heights[b6]
-    if l2_B <= 0.0:
-        return None
-    t2_B = new_heights[b6] + l2_B * rng.random()
-    lo_B = max(new_heights[b4], t2_B)
-    win_B = new_heights[b3] - lo_B
-    if win_B <= 0.0:
-        return None
-    t1_B = lo_B + win_B * rng.random()
-    g = float(rng.random())
-    try:
-        nv1 = _split_edge(new_net, new_heights, b3, b4, t1_B)
-        nv2 = _split_edge(new_net, new_heights, b5, b6, t2_B)
-        in_e = list(new_net.in_edges(nv2))
-        if len(in_e) != 1:
-            return None
-        in_e[0].set_gamma(1.0 - g)
-        nv2.set_is_reticulation(True)
-        new_net.add_edges(Edge(nv1, nv2, gamma=g))
-    except Exception:
-        return None
-    if _has_parallel_edges(new_net):
-        return None
-    try:
-        if not new_net.is_acyclic():
-            return None
-    except Exception:
-        return None
-    # Level cap (e.g. level-1 mode): relocation keeps the reticulation
-    # count fixed but can still slide a hybrid into an already-occupied
-    # blob, raising the level.  Reject before the coupled gene-tree
-    # re-proposal / scoring, mirroring the guard in the coupled add.
-    if (
-        state.priors.max_level is not None
-        and _network_level(new_net) > state.priors.max_level
-    ):
-        return None
-    _sync_lengths(new_net, new_heights)
-
-    # Guided joint gene-tree re-proposal under the relocated network.
-    repro = _coupled_gene_tree_reproposal(state, new_net, old_net, rng)
-    if repro is None:
-        return None
-    new_gts, new_hs, log_qf_gt, log_qr_gt = repro
-
-    loghr = _relocation_loghr(l2_B, win_B, l2_A, win_A, log_qf_gt, log_qr_gt)
-
-    state.species_net = new_net
-    state.net_heights = new_heights
-    state.gene_trees = new_gts
-    state.gt_heights = new_hs
-    state._engine.invalidate_network()
-    for i in range(state._engine.n_loci):
-        state._engine.invalidate_locus(i)
-
-    def undo() -> None:
-        """Revert this proposal: restore the captured pre-move state."""
-        state.species_net = old_net
-        state.net_heights = old_heights
-        state.gene_trees = old_gts
-        state.gt_heights = old_gt_h
-        state._engine.restore_caches(snap)
-
-    return loghr, undo
+    return _core._seq_op_relocate_reticulation_coupled(state, rng)
 
 
 # ======================================================================
@@ -3723,51 +2230,14 @@ def _topology_signature(newick: str):
 
     Returns ``None`` if the newick cannot be parsed.
     """
-    try:
-        net = Network.from_newick(newick)
-    except Exception:
-        return None
-    leaves = {n.label for n in net.get_leaves()}
-    n = len(leaves)
-    cache: dict = {}
-
-    def desc(v) -> frozenset:
-        """Memoized leaf-label set at/below ``v``."""
-        if v in cache:
-            return cache[v]
-        kids = net.get_children(v)
-        if not kids:
-            r = frozenset({v.label})
-        else:
-            acc: set = set()
-            for c in kids:
-                acc |= desc(c)
-            r = frozenset(acc)
-        cache[v] = r
-        return r
-
-    clades = set()
-    n_ret = 0
-    for v in net.V():
-        if v.is_reticulation():
-            n_ret += 1
-        ds = desc(v)
-        if 1 < len(ds) < n:
-            clades.add(ds)
-    return (n_ret, frozenset(clades))
+    return _core._seq_topology_signature(newick)
 
 
 def _reticulation_posterior(
     samples: Sequence["MCMCSeqSample"],
 ) -> dict[int, float]:
     """Posterior distribution over the reticulation count from ``samples``."""
-    if not samples:
-        return {}
-    counts: dict[int, int] = {}
-    for s in samples:
-        counts[s.num_reticulations] = counts.get(s.num_reticulations, 0) + 1
-    tot = len(samples)
-    return {k: counts[k] / tot for k in sorted(counts)}
+    return _core._seq_reticulation_posterior(list(samples))
 
 
 def _count_free_parameters(num_leaves: int, num_reticulations: int) -> int:
@@ -3784,7 +2254,7 @@ def _count_free_parameters(num_leaves: int, num_reticulations: int) -> int:
     comparison, and each extra reticulation costs exactly ``\Delta k = 3`` --
     the penalty that decides whether its likelihood gain is worth it.
     """
-    return num_leaves + 3 * num_reticulations
+    return _core._seq_count_free_parameters(num_leaves, num_reticulations)
 
 
 def _information_criteria(
@@ -3796,38 +2266,14 @@ def _information_criteria(
     correction ``AICc = AIC + 2k(k+1) / (n - k - 1)`` (falls back to ``AIC``
     when ``n`` is unknown or ``n <= k + 1``).  Lower is better.
     """
-    aic = 2.0 * k - 2.0 * log_likelihood
-    out = {"log_likelihood": float(log_likelihood), "k": int(k), "AIC": aic}
-    if n is not None and n > 0:
-        out["n"] = int(n)
-        out["BIC"] = k * math.log(n) - 2.0 * log_likelihood
-        denom = n - k - 1
-        out["AICc"] = aic + (2.0 * k * (k + 1) / denom) if denom > 0 else aic
-    else:
-        out["BIC"] = float("nan")
-        out["AICc"] = aic
-    return out
+    return _core._seq_information_criteria(log_likelihood, k, n)
 
 
 def _topology_posterior(
     samples: Sequence["MCMCSeqSample"], top_n: Optional[int] = None
 ) -> list[tuple[str, float]]:
     """Ranked ``(representative_newick, posterior_probability)`` topologies."""
-    sig_count: dict = {}
-    sig_rep: dict = {}
-    n = 0
-    for s in samples:
-        sig = _topology_signature(s.network_newick)
-        if sig is None:
-            continue
-        n += 1
-        sig_count[sig] = sig_count.get(sig, 0) + 1
-        sig_rep.setdefault(sig, s.network_newick)
-    if n == 0:
-        return []
-    ranked = sorted(sig_count.items(), key=lambda kv: -kv[1])
-    out = [(sig_rep[sig], cnt / n) for sig, cnt in ranked]
-    return out[:top_n] if top_n else out
+    return _core._seq_topology_posterior(list(samples), top_n)
 
 
 # ======================================================================

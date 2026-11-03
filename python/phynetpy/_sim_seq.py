@@ -61,6 +61,11 @@ Units match the rest of the MCMC_SEQ stack: heights / branch lengths are in
 expected substitutions per site and ``theta = 4 N mu`` (per-pair coalescent
 rate ``2/theta``).
 
+The coalescent sweep, the sequence evolution and the per-locus loop run in
+the compiled core (``phynetpy._core``).  Every random draw still comes from
+the caller's ``numpy.random.Generator`` in the same order as before, so a
+seeded run reproduces.
+
 Docs   - [x]
 Tests  - [x]
 Design - [x]
@@ -73,8 +78,9 @@ from typing import Any, Optional
 
 import numpy as np
 
+from . import _core
+from ._core import _Lineage
 from .Network import Network, Node, Edge
-from .GraphUtils import _edge_between, _node_heights
 from ._seq_likelihood import (
     SubstitutionModel,
     JC69,
@@ -175,52 +181,16 @@ def _reticulation_parent_gammas(
     Returns:
         ``[(edge0, gamma0), (edge1, gamma1)]`` with ``gamma0 + gamma1 == 1``.
     """
-    in_edges = sorted(net.in_edges(retic), key=lambda edge: edge.src.label)
-    if len(in_edges) != 2:
-        raise ValueError(
-            f"Reticulation {retic.label!r} must have exactly two parent edges."
-        )
-    e0, e1 = in_edges
-    g0 = e0.get_gamma() or 0.0
-    g1 = e1.get_gamma() or 0.0
-    total = g0 + g1
-    if abs(total - 1.0) < 1e-9:
-        return [(e0, g0), (e1, g1)]
-    if total <= 0.0:
-        return [(e0, 0.5), (e1, 0.5)]
-    # One edge annotated (the other left at the 0.0 default): treat the set
-    # value as gamma and give its complement to the sibling edge.
-    if g1 == 0.0:
-        return [(e0, g0), (e1, 1.0 - g0)]
-    if g0 == 0.0:
-        return [(e0, 1.0 - g1), (e1, g1)]
-    # Both set but not normalised: renormalise.
-    return [(e0, g0 / total), (e1, g1 / total)]
+    return _core.sim_reticulation_parent_gammas(net, retic)
 
 
 # ======================================================================
 # Gene-tree simulation (multispecies network coalescent)
 # ======================================================================
 
-class _Lineage:
-    """One ancestral gene lineage during the coalescent sweep.
-
-    Attributes:
-        newick: Newick string of the subtree subtended by this lineage.
-        height: Height (substitution units) of the lineage's youngest open end.
-    """
-
-    __slots__ = ("newick", "height")
-
-    def __init__(self, newick: str, height: float) -> None:
-        """Create a new ``_Lineage``.
-
-        Args:
-            newick: Newick string of the subtree subtended by this lineage.
-            height: Height (substitution units) of its youngest open end.
-        """
-        self.newick = newick
-        self.height = height
+# ``_Lineage`` -- one ancestral gene lineage during the coalescent sweep
+# (attributes ``newick`` and ``height``) -- is the compiled class imported
+# above.
 
 
 def _coalesce_within(
@@ -251,28 +221,9 @@ def _coalesce_within(
         The lineages exiting the top of the branch (length 1 when ``t_end`` is
         ``None``).
     """
-    pool = list(lineages)
-    t = t_start
-    while len(pool) > 1:
-        u = len(pool)
-        rate = u * (u - 1) / theta
-        wait = rng.exponential(1.0 / rate)
-        if t_end is not None and t + wait >= t_end:
-            break
-        t += wait
-        i, j = rng.choice(u, size=2, replace=False)
-        a, b = pool[int(i)], pool[int(j)]
-        label = f"i{counter[0]}"
-        counter[0] += 1
-        merged = _Lineage(
-            f"({a.newick}:{t - a.height:.10f},{b.newick}:{t - b.height:.10f}){label}",
-            t,
-        )
-        # Remove the two children (higher index first) and add the parent.
-        for k in sorted((int(i), int(j)), reverse=True):
-            pool.pop(k)
-        pool.append(merged)
-    return pool
+    return _core.sim_coalesce_within(
+        lineages, t_start, t_end, theta, rng, counter
+    )
 
 
 def simulate_gene_tree(
@@ -307,120 +258,8 @@ def simulate_gene_tree(
         A rooted, ultrametric :class:`Network` (a tree) with branch lengths in
         substitution units and leaves labelled by the sampled alleles.
     """
-    require_branch_length_unit(
-        species_net,
-        BranchLengthUnit.SUBSTITUTIONS_PER_SITE,
-        context="MSNC gene-tree simulation",
-    )
-    leaves = sorted(
-        species_net.get_leaves(), key=lambda node: node.label
-    )
-    if not leaves and len(species_net.V()) == 1:
-        leaves = list(species_net.V())
-    leaf_names = {leaf.label for leaf in leaves}
-    unknown = set(alleles_per_species) - leaf_names
-    if unknown:
-        raise ValueError(
-            f"allele mapping contains unknown species: {sorted(unknown)}."
-        )
-    if any(not labels for labels in alleles_per_species.values()):
-        raise ValueError("every mapped species must have at least one allele.")
-    allele_labels = [
-        label
-        for labels in alleles_per_species.values()
-        for label in labels
-    ]
-    if len(allele_labels) != len(set(allele_labels)):
-        raise ValueError("allele labels must be unique across species.")
-    heights = _node_heights(species_net)
-    counter: list[int] = [0]
-
-    def theta_above(
-        child: Node,
-        parent: Optional[Node] = None,
-    ) -> float:
-        """Population mutation rate for the branch above ``child``."""
-
-        return resolve_branch_theta(
-            theta,
-            branch_thetas,
-            child,
-            parent=parent,
-        )
-
-    # Lineages waiting at the bottom (child end) of each species edge.
-    edge_bottom: dict[Edge, list[_Lineage]] = {}
-    root_newick: Optional[str] = None
-
-    # Seed the leaves.
-    for leaf in leaves:
-        labels = alleles_per_species.get(leaf.label, [leaf.label])
-        lineages = [_Lineage(lab, 0.0) for lab in labels]
-        in_edges = sorted(
-            species_net.in_edges(leaf), key=lambda edge: edge.src.label
-        )
-        if in_edges:  # leaf below the root
-            edge_bottom.setdefault(in_edges[0], []).extend(lineages)
-        else:  # degenerate single-leaf "network"
-            final = _coalesce_within(
-                lineages, 0.0, None, theta_above(leaf), rng, counter
-            )
-            root_newick = final[0].newick if final else ""
-
-    # Process every non-leaf node from youngest to oldest.
-    internal = [v for v in species_net.V() if species_net.get_children(v)]
-    internal.sort(key=lambda v: (heights[v], v.label))
-
-    for v in internal:
-        # Gather lineages arriving at v: coalesce each child branch up to h[v].
-        arriving: list[_Lineage] = []
-        for child in sorted(
-            species_net.get_children(v), key=lambda node: node.label
-        ):
-            e = _edge_between(species_net, v, child)
-            bottom = edge_bottom.get(e, [])
-            top = _coalesce_within(
-                bottom,
-                heights[child],
-                heights[v],
-                theta_above(child, v),
-                rng,
-                counter,
-            )
-            arriving.extend(top)
-
-        parents = sorted(
-            species_net.get_parents(v), key=lambda node: node.label
-        )
-        if not parents:
-            # Root: coalesce remaining lineages on the infinite branch.
-            final = _coalesce_within(
-                arriving, heights[v], None, theta_above(v), rng, counter
-            )
-            root_newick = final[0].newick if final else ""
-        elif v.is_reticulation():
-            # Distribute lineages across the two parent edges by gamma.
-            (eA, gA), (eB, _gB) = _reticulation_parent_gammas(species_net, v)
-            for lineage in arriving:
-                target = eA if rng.random() < gA else eB
-                edge_bottom.setdefault(target, []).append(lineage)
-        else:
-            # Tree node: all arriving lineages enter the single parent branch.
-            pe = _edge_between(species_net, parents[0], v)
-            edge_bottom.setdefault(pe, []).extend(arriving)
-
-    if not root_newick:
-        raise RuntimeError("Coalescent simulation produced no root lineage.")
-    if "(" not in root_newick:
-        # A single sampled lineage: build a trivial one-node tree.
-        net = Network(
-            branch_length_unit=BranchLengthUnit.SUBSTITUTIONS_PER_SITE
-        )
-        net.add_nodes(Node(name=root_newick))
-        return net
-    return Network.from_newick(
-        root_newick + ";",
-        branch_length_unit=BranchLengthUnit.SUBSTITUTIONS_PER_SITE,
+    return _core.sim_gene_tree(
+        species_net, alleles_per_species, theta, rng, branch_thetas
     )
 
 
@@ -444,10 +283,7 @@ def _evolve_states(
     Returns:
         ``int`` array of child states, length ``n_sites``.
     """
-    cdf = np.cumsum(P, axis=1)          # (4, 4); cdf[s, 3] == 1
-    rows = cdf[parent_states]           # (n_sites, 4)
-    u = rng.random(parent_states.shape[0])
-    return (u[:, None] < rows).argmax(axis=1).astype(np.intp)
+    return _core.sim_evolve_states(parent_states, P, rng)
 
 
 def simulate_sequences(
@@ -472,36 +308,7 @@ def simulate_sequences(
         Map from leaf label -> simulated nucleotide string (length ``n_sites``,
         alphabet ``A,C,G,T``).
     """
-    require_branch_length_unit(
-        gene_tree,
-        BranchLengthUnit.SUBSTITUTIONS_PER_SITE,
-        context="sequence simulation",
-    )
-    if n_sites <= 0:
-        raise ValueError("n_sites must be positive.")
-    root = gene_tree.root()
-    states: dict[Node, np.ndarray] = {
-        root: rng.choice(4, size=n_sites, p=model.pi)
-    }
-
-    # Pre-order: propagate each parent's states to its children.
-    stack = [root]
-    while stack:
-        node = stack.pop()
-        parent_states = states[node]
-        for child in gene_tree.get_children(node):
-            edge = _edge_between(gene_tree, node, child)
-            t = edge.get_length()
-            t = 0.0 if t is None else float(t)
-            P = model.p_matrix(t)
-            states[child] = _evolve_states(parent_states, P, rng)
-            stack.append(child)
-
-    out: dict[str, str] = {}
-    for leaf in gene_tree.get_leaves():
-        seq = states[leaf]
-        out[leaf.label] = "".join(DNA_STATES[int(s)] for s in seq)
-    return out
+    return _core.sim_sequences(gene_tree, model, n_sites, rng)
 
 
 # ======================================================================
@@ -550,15 +357,16 @@ def simulate_multilocus(
     model = model if model is not None else JC69()
     species_of = {a: sp for sp, alleles in mapping.items() for a in alleles}
 
-    loci: list[dict[str, str]] = []
-    gene_trees: list[Network] = []
-    for _ in range(n_loci):
-        gt = simulate_gene_tree(
-            species_net, mapping, theta, rng, branch_thetas=branch_thetas
-        )
-        aln = simulate_sequences(gt, model, seq_length, rng)
-        gene_trees.append(gt)
-        loci.append(aln)
+    loci, gene_trees = _core.sim_multilocus(
+        species_net,
+        mapping,
+        n_loci,
+        seq_length,
+        theta,
+        model,
+        branch_thetas,
+        rng,
+    )
 
     return SimulatedData(
         loci=loci,

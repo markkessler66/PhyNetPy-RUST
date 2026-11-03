@@ -17,7 +17,7 @@
 ##
 ##############################################################################
 
-""" 
+"""
 Author : Mark Kessler
 Last Edit : 2/12/26
 First Included in Version : 1.1.0
@@ -28,6 +28,11 @@ Simulates biallelic (SNP) data by drawing one exact MSNC genealogy per
 unlinked site and evolving a stationary 2-state continuous-time Markov chain
 down it. This includes ILS, reticulation routing, and multiple samples per
 species under the same model used by the Bryant marker likelihood.
+
+The network generation (node relabelling, reticulation grafting) and the
+per-site simulation run in the compiled core (``phynetpy._core``); every
+random draw still comes from the seeded ``numpy.random.Generator`` in the
+same order as before, so a seeded run reproduces.
 
 Usage:
     from PhyNetPy.SNPSimulator import simulate, random_network
@@ -54,6 +59,7 @@ import warnings
 
 import numpy as np
 
+from . import _core
 from .Network import Network, Node, Edge
 from .BirthDeath import Yule
 from ._sim_markers import simulate_biallelic_markers
@@ -68,10 +74,10 @@ from ._units import BranchLengthUnit, BranchThetaKey
 class SimulatedSNPData:
     """
     Container for simulated SNP data and the generating network.
-    
+
     Attributes:
         network (Network): The phylogenetic network used for simulation.
-        data (dict[str, list[int]]): Mapping from taxon name to a list of 
+        data (dict[str, list[int]]): Mapping from taxon name to a list of
                                       red allele counts per site.
         n_taxa (int): Number of leaf taxa.
         n_sites (int): Number of simulated SNP sites.
@@ -110,7 +116,7 @@ class SimulatedSNPData:
         The output file contains:
             - TAXA block with taxon labels
             - DATA block with one hexadecimal red-allele count per site
-            - TREES block with the network in extended newick format 
+            - TREES block with the network in extended newick format
               (including branch lengths and gamma annotations)
 
         Args:
@@ -177,11 +183,11 @@ def random_network(
     seed: int | None = None
 ) -> Network:
     """
-    Generate a random phylogenetic network with n taxa and a given number 
+    Generate a random phylogenetic network with n taxa and a given number
     of reticulations.
 
-    First generates a random tree using a Yule (pure-birth) process, then 
-    rebuilds the topology with clean node names. Finally, grafts reticulation 
+    First generates a random tree using a Yule (pure-birth) process, then
+    rebuilds the topology with clean node names. Finally, grafts reticulation
     edges to reach the desired reticulation count.
 
     Note: The ``level`` parameter specifies the number of reticulation nodes
@@ -194,11 +200,11 @@ def random_network(
                  joining two internal nodes, and a reticulation consumes two
                  non-nested ones, so n >= 5 in practice for level >= 1.
         level (int): Number of reticulation nodes to add. Defaults to 1.
-        birth_rate (float): Birth rate for the Yule process. Larger values 
+        birth_rate (float): Birth rate for the Yule process. Larger values
                             produce shorter branch lengths. Defaults to 1.0.
-        gamma_range (tuple[float, float]): Range from which inheritance 
-                                            probabilities (gamma) are 
-                                            uniformly drawn. Defaults to 
+        gamma_range (tuple[float, float]): Range from which inheritance
+                                            probabilities (gamma) are
+                                            uniformly drawn. Defaults to
                                             (0.2, 0.8).
         seed (int | None): Random seed for reproducibility. Defaults to None.
 
@@ -211,7 +217,7 @@ def random_network(
                      with however many were added.
 
     Returns:
-        Network: A phylogenetic network with n leaves and at most `level` 
+        Network: A phylogenetic network with n leaves and at most `level`
                  reticulation nodes.
     """
     if n < 2:
@@ -221,26 +227,12 @@ def random_network(
 
     rng = np.random.default_rng(seed)
 
-    # Step 1: Generate a base tree via Yule process
-    yule = Yule(gamma=birth_rate, n=n, rng=rng)
-    net = yule.generate_network()
-
-    # Yule emits "spec*"/"internal*"/"root" labels, and reports branch lengths
-    # in expected substitutions per site -- a unit Network cannot infer itself.
-    _clean_node_names(net)
-    net.set_branch_length_unit(BranchLengthUnit.SUBSTITUTIONS_PER_SITE)
-
-    # Step 2: Add reticulations
-    for retic_id in range(level):
-        gamma = rng.uniform(gamma_range[0], gamma_range[1])
-        if not _add_reticulation(net, rng, gamma, retic_id):
-            warnings.warn(
-                f"Could not place reticulation #{retic_id}. "
-                f"Network has {retic_id} reticulations instead of {level}."
-            )
-            break
-
-    return net
+    # The Yule draw, the relabelling and the reticulation placements all run
+    # in the compiled core, drawing from ``rng`` in the same order as before.
+    return _core.snp_random_network(
+        rng, int(n), int(level), float(birth_rate),
+        float(gamma_range[0]), float(gamma_range[1]),
+    )
 
 
 def _clean_node_names(net: Network) -> None:
@@ -259,30 +251,7 @@ def _clean_node_names(net: Network) -> None:
     Returns:
         None
     """
-    root = net.root()
-    ordered_leaves = sorted(net.get_leaves(), key = lambda nd : nd.label)
-    leaf_rank = {leaf : i for i, leaf in enumerate(ordered_leaves)}
-
-    renames = [(leaf, f"T{i + 1}") for leaf, i in leaf_rank.items()]
-    renames.append((root, "Root"))
-
-    # Internal numbering keys off depth, then the lowest-ranked leaf beneath the
-    # node. A plain BFS discovery order would be simpler but not reproducible:
-    # V(), get_children(), and hence traversal order are all backed by sets, and
-    # Node.__hash__ is hash(name), which Python randomizes per process.
-    depth = net.bfs_dfs()[0]
-    below = net.leaf_descendants_all()
-    named = set(leaf_rank) | {root}
-    internal = sorted(
-        (node for node in depth if node not in named),
-        key = lambda nd : (depth[nd], min(leaf_rank[l] for l in below[nd]))
-    )
-    renames.extend((nd, f"I{i}") for i, nd in enumerate(internal, start = 1))
-
-    # Names are resolved up front: renaming mutates each node's hash, so the
-    # pairs cannot be looked up from a Node-keyed container mid-loop.
-    for node, name in renames:
-        net.update_node_name(node, name)
+    _core.snp_clean_node_names(net)
 
 
 def _add_reticulation(
@@ -299,7 +268,7 @@ def _add_reticulation(
         2. Pick two edges that are NOT in an ancestor-descendant relationship
            (to avoid creating cycles).
         3. Bisect each edge to create two new internal nodes.
-        4. The first new node becomes a tree node; the second becomes the 
+        4. The first new node becomes a tree node; the second becomes the
            hybrid (#H) node with two parents.
 
     This deliberately does not delegate to ``GraphUtils.add_hybrid``, which
@@ -314,89 +283,10 @@ def _add_reticulation(
         retic_id (int): Integer identifier for naming the hybrid node.
 
     Returns:
-        bool: True if a reticulation was successfully added, False if 
+        bool: True if a reticulation was successfully added, False if
               not enough candidate edges were found.
     """
-    # Candidates join two non-leaf, non-reticulation nodes: bisecting a pendant
-    # edge would hang a leaf below the hybrid, and reusing a reticulation
-    # endpoint would nest hybridizations. They are sorted because Network.E()
-    # is backed by a set whose order varies with PYTHONHASHSEED, which would
-    # otherwise leave the draw below irreproducible across processes.
-    leaves = set(net.get_leaves())
-    candidates = sorted(
-        (
-            edge for edge in net.E()
-            if {edge.src, edge.dest}.isdisjoint(leaves)
-            and not edge.src.is_reticulation()
-            and not edge.dest.is_reticulation()
-        ),
-        key = lambda edge : (edge.src.label, edge.dest.label)
-    )
-
-    if len(candidates) < 2:
-        return False
-
-    # Resample until the two edges are node-disjoint and neither lies in the
-    # other's subtree; the hybrid edge would otherwise close a directed cycle.
-    for _ in range(50):
-        idxs = rng.choice(len(candidates), size=2, replace=False)
-        edge1, edge2 = candidates[idxs[0]], candidates[idxs[1]]
-
-        ends_1 = {edge1.src, edge1.dest}
-        ends_2 = {edge2.src, edge2.dest}
-        if ends_1 & ends_2:
-            continue
-        if ends_2 & net.get_subtree_at(edge1.dest):
-            continue
-        if ends_1 & net.get_subtree_at(edge2.dest):
-            continue
-
-        break
-    else:
-        return False
-
-    e1_src, e1_dest = edge1.src, edge1.dest
-    e2_src, e2_dest = edge2.src, edge2.dest
-
-    # Bisect edge 1: e1_src -> new_tree_node -> e1_dest
-    e1_len = edge1.get_length()
-    half1 = e1_len / 2.0
-
-    new_tree_node = Node(name=f"I_r{retic_id}")
-    t_tree = e1_src.get_time() + half1
-    new_tree_node.set_time(t_tree)
-
-    net.add_nodes(new_tree_node)
-    net.remove_edge(edge1)
-
-    top1 = Edge(e1_src, new_tree_node, length=half1)
-    bot1 = Edge(new_tree_node, e1_dest, length=half1)
-    net.add_edges([top1, bot1])
-
-    # Bisect edge 2: e2_src -> hybrid_node -> e2_dest
-    e2_len = edge2.get_length()
-    half2 = e2_len / 2.0
-
-    hybrid = Node(name=f"#H{retic_id}", is_reticulation=True)
-    t_hybrid = e2_src.get_time() + half2
-    hybrid.set_time(t_hybrid)
-
-    net.add_nodes(hybrid)
-    net.remove_edge(edge2)
-
-    top2 = Edge(e2_src, hybrid, length=half2, gamma=gamma)
-    bot2 = Edge(hybrid, e2_dest, length=half2)
-    net.add_edges([top2, bot2])
-
-    # Add reticulation edge: new_tree_node -> hybrid
-    retic_len = abs(t_hybrid - t_tree)
-    if retic_len < 1e-10:
-        retic_len = 0.01  # minimum branch length to avoid numerical issues
-
-    retic_edge = Edge(new_tree_node, hybrid, length=retic_len, gamma=1 - gamma)
-    net.add_edges(retic_edge)
-
-    return True
+    return _core.snp_add_reticulation(net, rng, float(gamma), int(retic_id))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -423,7 +313,7 @@ def simulate(
     or multiple samples per taxon.
 
     Args:
-        n (int): Expected number of taxa — used only for validation. 
+        n (int): Expected number of taxa — used only for validation.
                  The actual taxa come from the network's leaves.
         s (int): Number of SNP sites to simulate.
         net (Network): The phylogenetic network to simulate data on.

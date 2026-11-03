@@ -1,7 +1,13 @@
 #! /usr/bin/env python
 # -*- coding: utf-8 -*-
 
-"""Exact unlinked biallelic-marker simulation under the MSNC."""
+"""Exact unlinked biallelic-marker simulation under the MSNC.
+
+The genealogy sampling and the two-state mutation process run in the
+compiled core (``phynetpy._core``); the functions here validate their
+arguments exactly as before and hand the random generator through, so a
+seeded run reproduces.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,7 @@ from typing import Mapping, Optional
 
 import numpy as np
 
+from . import _core
 from .Network import Network, Node
 from ._sim_seq import simulate_gene_tree
 from ._units import (
@@ -28,19 +35,7 @@ def _mutate_biallelic_state(
 ) -> int:
     """Evolve one green/red lineage under the exact two-state CTMC."""
 
-    length = float(length)
-    if not np.isfinite(length) or length < 0.0:
-        raise ValueError(
-            f"gene-tree branch lengths must be finite and non-negative; "
-            f"got {length}."
-        )
-    total = u + v
-    decay = np.exp(-total * length)
-    if state == 1:
-        p_red = v / total + (u / total) * decay
-    else:
-        p_red = (v / total) * (1.0 - decay)
-    return int(rng.random() < p_red)
+    return _core.sim_mutate_biallelic_state(state, float(length), u, v, rng)
 
 
 def simulate_biallelic_on_gene_tree(
@@ -60,27 +55,7 @@ def simulate_biallelic_on_gene_tree(
         raise ValueError(
             f"u and v must be finite and positive; got u={u}, v={v}."
         )
-    root = gene_tree.root()
-    states: dict[Node, int] = {
-        root: int(rng.random() < (v / (u + v)))
-    }
-    stack = [root]
-    while stack:
-        parent = stack.pop()
-        for child in sorted(
-            gene_tree.get_children(parent), key=lambda node: node.label
-        ):
-            edge = gene_tree.get_edge(parent, child)
-            states[child] = _mutate_biallelic_state(
-                states[parent], edge.get_length(), u, v, rng
-            )
-            stack.append(child)
-    return {
-        leaf.label: states[leaf]
-        for leaf in sorted(
-            gene_tree.get_leaves(), key=lambda node: node.label
-        )
-    }
+    return _core.sim_biallelic_on_gene_tree(gene_tree, u, v, rng)
 
 
 def simulate_biallelic_markers(
@@ -135,19 +110,16 @@ def simulate_biallelic_markers(
         normalized[taxon] = copied
 
     generator = rng if rng is not None else np.random.default_rng()
-    data = {taxon: [] for taxon in normalized}
-    for _ in range(n_sites):
-        genealogy = simulate_gene_tree(
-            network,
-            normalized,
-            theta,
-            generator,
-            branch_thetas=branch_thetas,
-        )
-        states = simulate_biallelic_on_gene_tree(genealogy, u, v, generator)
-        for taxon, labels in normalized.items():
-            data[taxon].append(sum(states[label] for label in labels))
-    return data
+    return _core.sim_biallelic_markers(
+        network,
+        n_sites,
+        normalized,
+        theta,
+        u,
+        v,
+        branch_thetas,
+        generator,
+    )
 
 
 __all__ = [

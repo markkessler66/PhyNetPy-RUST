@@ -243,6 +243,79 @@ fn enumerate_allele_maps_py(
     Ok(Some(result))
 }
 
+/// Most maps enumerated before ``_select_allele_maps`` picks its subset.
+const SELECT_CAP: usize = 50_000;
+
+/// Up to ``limit`` allele maps compatible with ``choices``.  When more
+/// exist, the maps returned are spread evenly across the enumeration order
+/// (every ``total / limit``-th map), so they differ in the assignments of
+/// early leaves as well as late ones.
+///
+/// This replaces the reference's PuLP / CBC integer program, which solved
+/// the assignment problem with a constant objective and excluded each
+/// solution from the next solve: an arbitrary, solver-dependent subset of
+/// the valid maps.  The subset here is deterministic and needs no external
+/// solver.  Enumeration stops after ``SELECT_CAP`` maps or the step budget,
+/// and the subset is then drawn from the maps enumerated so far.
+#[pyfunction]
+#[pyo3(name = "_select_allele_maps")]
+fn select_allele_maps_py(
+    py: Python<'_>,
+    choices: Vec<(String, Vec<String>)>,
+    limit: usize,
+) -> PyResult<Vec<Py<AlleleMap>>> {
+    let mut names: Vec<&str> = Vec::new();
+    let mut ids: FxHashMap<&str, usize> = FxHashMap::default();
+    let copies: Vec<Vec<usize>> = choices
+        .iter()
+        .map(|(_, cs)| {
+            cs.iter()
+                .map(|c| {
+                    *ids.entry(c.as_str()).or_insert_with(|| {
+                        names.push(c.as_str());
+                        names.len() - 1
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    let n = choices.len();
+    let mut search = MapSearch {
+        copies: &copies,
+        used: vec![false; names.len()],
+        chosen: vec![usize::MAX; n],
+        out: Vec::new(),
+        limit: Some(SELECT_CAP),
+        steps: 0,
+    };
+    search.rec(n);
+    search.out.truncate(SELECT_CAP);
+    let total = search.out.len();
+    let picks: Vec<usize> = if total <= limit {
+        (0..total).collect()
+    } else {
+        (0..limit).map(|i| i * total / limit).collect()
+    };
+    let mut result = Vec::with_capacity(picks.len());
+    for idx in picks {
+        let chosen = &search.out[idx];
+        let d = PyDict::new(py);
+        let s = PySet::empty(py)?;
+        for (i, (leaf, _)) in choices.iter().enumerate() {
+            d.set_item(leaf, names[chosen[i]])?;
+            s.add(names[chosen[i]])?;
+        }
+        result.push(Py::new(
+            py,
+            AlleleMap {
+                map: d.unbind(),
+                disallowed: s.unbind(),
+            },
+        )?);
+    }
+    Ok(result)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // MUL-tree construction (``MUL.to_mul``)
 // ═══════════════════════════════════════════════════════════════════════
@@ -996,6 +1069,7 @@ fn allop_xl_helper_py(
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AlleleMap>()?;
     m.add_function(wrap_pyfunction!(enumerate_allele_maps_py, m)?)?;
+    m.add_function(wrap_pyfunction!(select_allele_maps_py, m)?)?;
     m.add_function(wrap_pyfunction!(allop_to_mul_py, m)?)?;
     m.add_function(wrap_pyfunction!(allop_score_py, m)?)?;
     m.add_function(wrap_pyfunction!(allop_xl_py, m)?)?;

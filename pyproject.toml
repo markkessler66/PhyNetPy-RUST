@@ -38,7 +38,6 @@ dependencies = [
     "networkx>=2.5",
     "biopython>=1.78",
     "python-nexus",
-    "pulp",
 ]
 dynamic = ["version"]
 

@@ -6,7 +6,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [0.8.0] -- Unreleased
+## [Unreleased]
+
+### Changed
+
+- MP-allop allele maps are enumerated natively: `allele_map_set_ilp` no
+  longer calls the PuLP / CBC integer program when a gene tree admits more
+  than `max_solutions` maps. It returns the same number of distinct, valid
+  maps, spread evenly across the enumeration instead of an arbitrary
+  solver-dependent subset, and `pulp` is no longer a dependency. On DEFJ
+  scenario J the set-up that took 4.5 s (10 gene trees) and 44 s (100 gene
+  trees) now takes milliseconds.
+
+---
+
+## [0.8.0] -- 2026-11-03
 
 ### Changed -- the computational core is now Rust
 

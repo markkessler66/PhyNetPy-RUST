@@ -51,15 +51,6 @@ from .MetropolisHastings import HillClimbing, Infer_MP_Allop_Kernel
 from .State import State
 from .GraphUtils import add_hybrid
 
-try:
-    from pulp import (
-        LpVariable, LpProblem, LpMaximize, lpSum, LpStatus,
-        value, PULP_CBC_CMD,
-    )
-    PULP_AVAILABLE = True
-except ImportError:
-    PULP_AVAILABLE = False
-
 from . import GraphUtils as utils
 
 """
@@ -461,96 +452,36 @@ def allele_map_set_ilp(g: Network,
                        gene_map: dict[str, list[str]],
                        max_solutions: int = 10) -> list[AlleleMap]:
     """
-    Compute valid allele maps using Integer Linear Programming.
-    Falls back to brute-force enumeration if PuLP is not installed.
+    Compute up to ``max_solutions`` valid allele maps for a gene tree.
 
-    The integer program only ever returns a subset of the valid maps when
-    there are more than ``max_solutions`` of them, so the maps are first
-    enumerated directly (in the compiled core); the solver is consulted only
-    when that enumeration exceeds ``max_solutions``.
+    The maps are enumerated in the compiled core.  When no more than
+    ``max_solutions`` exist, all of them are returned; otherwise a subset of
+    ``max_solutions`` distinct maps spread evenly across the enumeration is
+    returned, so the sample varies the assignment of every polyploid taxon
+    rather than only the last few.  (Earlier versions solved an integer
+    program with PuLP / CBC for the oversize case; it returned an arbitrary
+    solver-dependent subset of the same size and dominated the running time
+    of MP-allop inference.  The name is kept for compatibility.)
 
     Args:
         g (Network): A gene tree
         gene_map (dict[str, list[str]]): A taxon map.
-        max_solutions (int): Maximum number of solutions to find.
+        max_solutions (int): Maximum number of maps to return.
+
+    Raises:
+        InferAllopError: If no valid allele map exists.
 
     Returns:
         list[AlleleMap]: a list of functions that map labels of g to
                          labels of a MUL tree.
     """
-    if not PULP_AVAILABLE:
-        return allele_map_set(g, gene_map)
-
-    maps = _core._enumerate_allele_maps(_leaf_choices(g, gene_map),
-                                        max_solutions)
-    if maps is not None:
-        if not maps:
-            raise InferAllopError("No valid allele map found")
-        return maps
-
-    return _allele_map_set_pulp(g, gene_map, max_solutions)
-
-def _allele_map_set_pulp(g: Network,
-                         gene_map: dict[str, list[str]],
-                         max_solutions: int = 10) -> list[AlleleMap]:
-    """
-    The integer-programming enumeration of up to ``max_solutions`` allele
-    maps (PuLP / CBC), used when more than ``max_solutions`` maps exist.
-    """
-    gene_leaves = g.get_leaves()
-    mul_leaves = set()
-    for copies in gene_map.values():
-        mul_leaves.update(copies)
-
-    x = LpVariable.dicts("map",
-                         ((i.label, j) for i in gene_leaves for j in mul_leaves),
-                         cat='Binary')
-
-    solutions = []
-
-    while len(solutions) < max_solutions:
-        prob = LpProblem("Allele_Mapping", LpMaximize)
-        prob += lpSum(x[i.label, j] for i in gene_leaves for j in mul_leaves)
-
-        for i in gene_leaves:
-            prob += lpSum(x[i.label, j] for j in mul_leaves) == 1
-
-        for j in mul_leaves:
-            prob += lpSum(x[i.label, j] for i in gene_leaves) <= 1
-
-        for i in gene_leaves:
-            valid_mul_leaves = get_other_copies(i, gene_map)
-            for j in mul_leaves:
-                if j not in valid_mul_leaves:
-                    prob += x[i.label, j] == 0
-
-        for prev_solution in solutions:
-            diff_constraint = []
-            for i in gene_leaves:
-                for j in mul_leaves:
-                    if prev_solution.map.get(i.label) == j:
-                        diff_constraint.append(1 - x[i.label, j])
-                    else:
-                        diff_constraint.append(x[i.label, j])
-            prob += lpSum(diff_constraint) >= 1
-
-        prob.solve(PULP_CBC_CMD(msg=False))
-
-        if LpStatus[prob.status] != 'Optimal':
-            break
-
-        allele_map = AlleleMap()
-        for i in gene_leaves:
-            for j in mul_leaves:
-                if value(x[i.label, j]) == 1:
-                    allele_map.put(i, j)
-
-        solutions.append(allele_map)
-
-    if not solutions:
+    choices = _leaf_choices(g, gene_map)
+    maps = _core._enumerate_allele_maps(choices, max_solutions)
+    if maps is None:
+        maps = _core._select_allele_maps(choices, max_solutions)
+    if not maps:
         raise InferAllopError("No valid allele map found")
-
-    return solutions
+    return maps
 
 ##############################
 ### MUL TREE & Allele Maps ###

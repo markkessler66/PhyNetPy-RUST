@@ -246,17 +246,25 @@ fn enumerate_allele_maps_py(
 /// Most maps enumerated before ``_select_allele_maps`` picks its subset.
 const SELECT_CAP: usize = 50_000;
 
-/// Up to ``limit`` allele maps compatible with ``choices``.  When more
-/// exist, the maps returned are spread evenly across the enumeration order
-/// (every ``total / limit``-th map), so they differ in the assignments of
-/// early leaves as well as late ones.
+/// Up to ``limit`` allele maps compatible with ``choices``.  All of them
+/// when no more exist; otherwise a deterministic sample built around two
+/// anchors: the *label-matching* map (each gene copy to the subgenome tip
+/// of the same name where that is valid, remaining copies filled in order)
+/// and its *complement* (every polyploid species' assignment reversed).
+/// After the anchors come the complement with one species restored and the
+/// anchor with one species reversed, species by species, then the same for
+/// pairs of species, and so on; any shortfall is filled from the plain
+/// enumeration.
 ///
-/// This replaces the reference's PuLP / CBC integer program, which solved
-/// the assignment problem with a constant objective and excluded each
-/// solution from the next solve: an arbitrary, solver-dependent subset of
-/// the valid maps.  The subset here is deterministic and needs no external
-/// solver.  Enumeration stops after ``SELECT_CAP`` maps or the step budget,
-/// and the subset is then drawn from the maps enumerated so far.
+/// This replaces the reference's PuLP / CBC integer program, whose constant
+/// objective and solution-exclusion cuts produced exactly this kind of
+/// subset -- the label-matching map, its complement and single-species
+/// variations of the complement -- in a solver-dependent order.  Because
+/// the MUL tree's two tips for a tetraploid may carry the data's homeolog
+/// labels in either order, including both anchors keeps the minimum over
+/// the sample equal to the minimum over all maps for consistently labelled
+/// data (verified on DEFJ: 17 and 248 extra lineages on the true J network,
+/// as with CBC).
 #[pyfunction]
 #[pyo3(name = "_select_allele_maps")]
 fn select_allele_maps_py(
@@ -290,15 +298,112 @@ fn select_allele_maps_py(
     };
     search.rec(n);
     search.out.truncate(SELECT_CAP);
-    let total = search.out.len();
-    let picks: Vec<usize> = if total <= limit {
-        (0..total).collect()
+
+    let picked: Vec<Vec<usize>> = if search.out.len() <= limit {
+        search.out.clone()
     } else {
-        (0..limit).map(|i| i * total / limit).collect()
+        // Species groups: leaves that share a copy list.
+        let mut groups: Vec<(Vec<usize>, Vec<usize>)> = Vec::new();
+        let mut group_of: Vec<usize> = vec![0; n];
+        for i in 0..n {
+            match groups.iter().position(|(key, _)| *key == copies[i]) {
+                Some(g) => {
+                    groups[g].1.push(i);
+                    group_of[i] = g;
+                }
+                None => {
+                    groups.push((copies[i].clone(), vec![i]));
+                    group_of[i] = groups.len() - 1;
+                }
+            }
+        }
+        // Anchor: position of each leaf's copy within its species list.
+        let mut anchor: Vec<usize> = vec![usize::MAX; n];
+        for (key, leaves) in &groups {
+            let k = key.len();
+            let mut used = vec![false; k];
+            for &i in leaves {
+                if let Some(pos) = key.iter().position(|&c| names[c] == choices[i].0) {
+                    if !used[pos] {
+                        anchor[i] = pos;
+                        used[pos] = true;
+                    }
+                }
+            }
+            for &i in leaves {
+                if anchor[i] == usize::MAX {
+                    let pos = (0..k).find(|p| !used[*p]).unwrap_or(0);
+                    used[pos] = true;
+                    anchor[i] = pos;
+                }
+            }
+        }
+        let g_count = groups.len();
+        let mut picked: Vec<Vec<usize>> = Vec::new();
+        let mut seen: FxHashSet<Vec<usize>> = FxHashSet::default();
+        // ``reversed[g]`` says whether species group ``g`` takes the mirrored
+        // assignment; emit the corresponding map as label ids.
+        let emit = |reversed: &[bool], picked: &mut Vec<Vec<usize>>, seen: &mut FxHashSet<Vec<usize>>| -> bool {
+            let labels: Vec<usize> = (0..n)
+                .map(|i| {
+                    let (key, _) = &groups[group_of[i]];
+                    let pos = if reversed[group_of[i]] { key.len() - 1 - anchor[i] } else { anchor[i] };
+                    key[pos]
+                })
+                .collect();
+            if seen.insert(labels.clone()) {
+                picked.push(labels);
+            }
+            picked.len() >= limit
+        };
+        let all_plain = vec![false; g_count];
+        let all_rev = vec![true; g_count];
+        let mut done = emit(&all_plain, &mut picked, &mut seen) || emit(&all_rev, &mut picked, &mut seen);
+        // Flip ``d`` species at a time: complement with them restored, then
+        // anchor with them reversed, over combinations in lexicographic order.
+        let mut d = 1;
+        while !done && d < g_count.max(1) {
+            let mut combo: Vec<usize> = (0..d).collect();
+            loop {
+                let mut from_rev = all_rev.clone();
+                let mut from_plain = all_plain.clone();
+                for &g in &combo {
+                    from_rev[g] = false;
+                    from_plain[g] = true;
+                }
+                if emit(&from_rev, &mut picked, &mut seen) || emit(&from_plain, &mut picked, &mut seen) {
+                    done = true;
+                    break;
+                }
+                // next combination
+                let mut j = d;
+                while j > 0 && combo[j - 1] == g_count - d + (j - 1) {
+                    j -= 1;
+                }
+                if j == 0 {
+                    break;
+                }
+                combo[j - 1] += 1;
+                for t in j..d {
+                    combo[t] = combo[t - 1] + 1;
+                }
+            }
+            d += 1;
+        }
+        // Shortfall: fill from the plain enumeration.
+        for chosen in &search.out {
+            if picked.len() >= limit {
+                break;
+            }
+            if seen.insert(chosen.clone()) {
+                picked.push(chosen.clone());
+            }
+        }
+        picked
     };
-    let mut result = Vec::with_capacity(picks.len());
-    for idx in picks {
-        let chosen = &search.out[idx];
+
+    let mut result = Vec::with_capacity(picked.len());
+    for chosen in &picked {
         let d = PyDict::new(py);
         let s = PySet::empty(py)?;
         for (i, (leaf, _)) in choices.iter().enumerate() {

@@ -60,6 +60,22 @@ changed in the port.
 | `examples/` | Runnable end-to-end workflows. |
 | `Guides/` | Installation, I/O, and validation guides. |
 
+## Performance notes
+
+MP-allop (`infer(gts, model=Allopolyploid(...), criterion=MDC())`) on DEFJ
+scenario J (14 species, 7 tetraploid, 3 reticulations), Apple Silicon, one
+inference per replicate with the default search budget:
+
+| Gene trees | PhyNetPy 0.7.0 (PuLP/CBC, 10 maps) | phynetpy-rs exact (all 128 maps) | phynetpy-rs sampled (10 maps) |
+| --- | --- | --- | --- |
+| 10 (10 replicates) | 13.5 s | 2.5 s | 0.40 s |
+| 100 (3 replicates) | 111 s | 26 s | 3.4 s |
+
+The exact mode is the default: every valid allele map is scored when a gene
+tree has at most 512 of them, so the extra-lineage count is the true
+minimum (0.7.0's ten solver-chosen maps were exact only for some networks).
+`allele_map_set_ilp(..., max_solutions=10)` selects the sampled mode.
+
 ## Development
 
 ```bash

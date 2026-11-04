@@ -448,25 +448,38 @@ def allele_map_set(g: Network,
     """
     return _core._enumerate_allele_maps(_leaf_choices(g, gene_map))
 
+# Up to this many allele maps per gene tree are scored exactly (every map);
+# a gene tree with more maps is scored over a sample of SAMPLED_ALLELE_MAPS.
+EXACT_ALLELE_MAP_LIMIT: int = 512
+SAMPLED_ALLELE_MAPS: int = 10
+
+
 def allele_map_set_ilp(g: Network,
                        gene_map: dict[str, list[str]],
-                       max_solutions: int = 10) -> list[AlleleMap]:
+                       max_solutions: int | None = None) -> list[AlleleMap]:
     """
-    Compute up to ``max_solutions`` valid allele maps for a gene tree.
+    Compute the allele maps a gene tree is scored over.
 
-    The maps are enumerated in the compiled core.  When no more than
-    ``max_solutions`` exist, all of them are returned; otherwise a subset of
-    ``max_solutions`` distinct maps spread evenly across the enumeration is
-    returned, so the sample varies the assignment of every polyploid taxon
-    rather than only the last few.  (Earlier versions solved an integer
-    program with PuLP / CBC for the oversize case; it returned an arbitrary
-    solver-dependent subset of the same size and dominated the running time
-    of MP-allop inference.  The name is kept for compatibility.)
+    With ``max_solutions`` left at ``None`` every valid map is returned when
+    there are at most ``EXACT_ALLELE_MAP_LIMIT`` of them (512, i.e. up to
+    nine tetraploid taxa), so the extra-lineage score is the exact minimum
+    over all maps.  Beyond that, or when ``max_solutions`` is given, at most
+    that many maps are returned: all of them if no more exist, otherwise a
+    deterministic sample built around the label-matching map and its
+    complement (see the core's ``_select_allele_maps``).
+
+    Earlier versions always capped the maps at ten and solved an integer
+    program with PuLP / CBC for the oversize case; that cap was a running-time
+    bound for the Python scorer, and the solver's subset was arbitrary and
+    only exact for some networks.  Pass ``max_solutions=10`` to reproduce
+    the sampled behaviour at the old cost model.  The name is kept for
+    compatibility.
 
     Args:
         g (Network): A gene tree
         gene_map (dict[str, list[str]]): A taxon map.
-        max_solutions (int): Maximum number of maps to return.
+        max_solutions (int | None): Cap on the number of maps; ``None`` for
+                                    exact scoring up to the module limit.
 
     Raises:
         InferAllopError: If no valid allele map exists.
@@ -476,9 +489,14 @@ def allele_map_set_ilp(g: Network,
                          labels of a MUL tree.
     """
     choices = _leaf_choices(g, gene_map)
-    maps = _core._enumerate_allele_maps(choices, max_solutions)
-    if maps is None:
-        maps = _core._select_allele_maps(choices, max_solutions)
+    if max_solutions is None:
+        maps = _core._enumerate_allele_maps(choices, EXACT_ALLELE_MAP_LIMIT)
+        if maps is None:
+            maps = _core._select_allele_maps(choices, SAMPLED_ALLELE_MAPS)
+    else:
+        maps = _core._enumerate_allele_maps(choices, max_solutions)
+        if maps is None:
+            maps = _core._select_allele_maps(choices, max_solutions)
     if not maps:
         raise InferAllopError("No valid allele map found")
     return maps

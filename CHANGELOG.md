@@ -10,13 +10,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- MP-allop allele maps are enumerated natively: `allele_map_set_ilp` no
-  longer calls the PuLP / CBC integer program when a gene tree admits more
-  than `max_solutions` maps. It returns the same number of distinct, valid
-  maps, spread evenly across the enumeration instead of an arbitrary
-  solver-dependent subset, and `pulp` is no longer a dependency. On DEFJ
-  scenario J the set-up that took 4.5 s (10 gene trees) and 44 s (100 gene
-  trees) now takes milliseconds.
+- MP-allop allele maps are enumerated natively and scored exactly:
+  `allele_map_set_ilp` no longer calls the PuLP / CBC integer program, and
+  by default returns every valid map when a gene tree has at most 512 of
+  them (nine tetraploid taxa), so the extra-lineage score is the exact
+  minimum over all maps rather than over an arbitrary solver-chosen ten.
+  Gene trees with more maps, or an explicit `max_solutions`, get a
+  deterministic sample built around the label-matching map and its
+  complement. `pulp` is no longer a dependency. On DEFJ scenario J the
+  set-up that took 4.5 s (10 gene trees) and 44 s (100 gene trees) now takes
+  milliseconds; see the README for timings of the exact and sampled modes.
 
 ---
 

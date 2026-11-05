@@ -76,6 +76,22 @@ tree has at most 512 of them, so the extra-lineage count is the true
 minimum (0.7.0's ten solver-chosen maps were exact only for some networks).
 `allele_map_set_ilp(..., max_solutions=10)` selects the sampled mode.
 
+Accuracy on the same runs, with every inferred network rescored over all
+maps and compared to the true network (mean ± standard error):
+
+| Gene trees | Mode | Extra lineages | mu-distance | Hardwired cluster distance |
+| --- | --- | --- | --- | --- |
+| 10 (n=30) | PhyNetPy 0.7.0 | 69.1 ± 5.7 | 12.3 ± 1.2 | 7.8 ± 0.9 |
+| 10 (n=30) | phynetpy-rs exact | 58.4 ± 5.0 | 10.7 ± 0.9 | 6.3 ± 0.8 |
+| 10 (n=30) | phynetpy-rs sampled | 60.3 ± 4.7 | 11.1 ± 1.1 | 6.9 ± 0.9 |
+| 100 (n=6) | PhyNetPy 0.7.0 | 537 ± 54 | 10.3 ± 1.3 | 5.5 ± 1.1 |
+| 100 (n=6) | phynetpy-rs exact | 396 ± 52 | 7.0 ± 1.1 | 3.2 ± 1.2 |
+| 100 (n=6) | phynetpy-rs sampled | 680 ± 62 | 12.7 ± 1.3 | 8.0 ± 0.9 |
+
+The true network scores 14 to 35 (10 trees) and 219 to 264 (100 trees) extra
+lineages on these replicates; the search is a hill climber and is not seed
+reproducible, hence the spread.
+
 ## Development
 
 ```bash

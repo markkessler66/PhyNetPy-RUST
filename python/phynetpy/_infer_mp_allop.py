@@ -41,6 +41,8 @@ Design - [x]
 from __future__ import annotations
 from typing import Any
 
+import warnings
+
 import numpy as np
 
 from . import _core
@@ -492,6 +494,13 @@ def allele_map_set_ilp(g: Network,
     if max_solutions is None:
         maps = _core._enumerate_allele_maps(choices, EXACT_ALLELE_MAP_LIMIT)
         if maps is None:
+            warnings.warn(
+                f"A gene tree admits more than {EXACT_ALLELE_MAP_LIMIT} allele "
+                f"maps, so it is scored over a sample of {SAMPLED_ALLELE_MAPS} "
+                "maps rather than exactly; raise "
+                "phynetpy._infer_mp_allop.EXACT_ALLELE_MAP_LIMIT for exact "
+                "scoring at a higher cost per iteration."
+            )
             maps = _core._select_allele_maps(choices, SAMPLED_ALLELE_MAPS)
     else:
         maps = _core._enumerate_allele_maps(choices, max_solutions)
